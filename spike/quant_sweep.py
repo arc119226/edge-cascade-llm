@@ -33,7 +33,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from export_shards import split_points  # noqa: E402
+from export_shards import load_fp32_model, split_points  # noqa: E402
 from quant_schemes import SCHEMES, outlier_stats  # noqa: E402
 
 CORPUS = Path(__file__).parent / "corpus.txt"
@@ -213,13 +213,12 @@ def main() -> None:
     ap.add_argument("--out", help="把結果表寫成 markdown")
     args = ap.parse_args()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     torch.manual_seed(args.seed)
     print(f"載入 {args.model} …")
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.float32, attn_implementation="eager")
+    model = load_fp32_model(args.model)
     model.eval()
 
     n_layers = model.config.num_hidden_layers

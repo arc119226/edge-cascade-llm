@@ -44,6 +44,11 @@ npm run deploy     # 建置 + 產生模型 + 部署
 第一次跑 `npm run prepare-model` 需要幾分鐘（要下載模型並量化），
 之後 `out/` 裡有東西就會直接沿用。
 
+> **`npm run setup` 會用 `--upgrade` 安裝。** 這是必要的：
+> `pip install X` 對已經裝過的套件只會說「Requirement already satisfied」而不升級。
+> 本專案需要 **transformers 5.0 以上**（v4 的 `from_pretrained` 不認得 `dtype` 參數），
+> 機器上若有舊版會導致匯出失敗。腳本會在版本太舊時直接擋下並告訴你怎麼升級。
+
 ### 想自己控制匯出參數
 
 只有在你要換模型或調整切分數時才需要手動跑。
@@ -239,6 +244,11 @@ shard_N.onnx   shard_N.onnx.data（或它的 .partN 片段）
 你打到 Windows 的 App Execution Alias 轉址 stub 了，不是真的 Python。
 最簡單的解法是**不要手動打 Python 指令**，改用 `npm run setup` 與 `npm run deploy` ——
 它們會自己找到正確的 Python。要手動跑的話見上面「陷阱二」。
+
+**`transformers 版本太舊`**
+機器上有舊版 transformers，而 `pip install` 不會自動升級。
+跑 `npm run setup`（已帶 `--upgrade`），或手動
+`python -m pip install --upgrade transformers`。
 
 **`找不到可用的 Python`**
 腳本試過 `python3`、`python`、`py -3` 都沒找到真的 Python。
