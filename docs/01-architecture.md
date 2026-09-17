@@ -140,8 +140,22 @@ K^*_i = \frac{\text{該 stage 權重} / \text{記憶體頻寬}_i}{2 \times \text
 
 ### 4.2 量化格式（M4 已實測敲定）
 
-**採用 `per-channel + 前 3% 通道保留 fp16`**，線路成本約 8.24 bits/值
-（相對純 int8 只多 3%，相對 fp16 省一半）。
+**採用 `per-channel + 前 3% 通道保留 fp16`**。
+
+> ⚠️ **本節原本寫「線路成本約 8.24 bits/值」，那是錯的 —— 它只算了 int8 本體。**
+>
+> 漏掉的兩項都不是可選的，必須跟著每一則訊息走：
+>
+> 1. **scale 表**。`perChannel()` 的 `scale[c]` 是對「這則訊息裡的這 K 個 token」
+>    取 `max|x[t][c]|` 算出來的，所以它跟著資料走 —— 接收端推不出來，也不能快取。
+> 2. **離群 channel 的索引表**。離群集合每則訊息重挑一次，所以也得送。
+>
+> 真實成本見 §4.5 的表，由 [`bench/wire_size.py`](../bench/wire_size.py) 產生。
+> K=8 時是 **10.24 bits/值**，不是 8.24 —— 差 24%。
+>
+> 這個漏算會讓方案排名反轉：把中繼資料算進去之後，group-64 在任何實際會用到的
+> K 底下都比較省。所以線路格式改成**兩個方案都實作、由 frame header 的
+> `schemeId` 決定**，等 M3 量到真實位元組與延遲再選預設值。
 
 完整數據：[`docs/data/quant-results.md`](data/quant-results.md)，
 可用 `python3 spike/quant_sweep.py --sweep all` 重現。
@@ -166,7 +180,11 @@ SmolLM2-135M、4 段（3 hop）實測：
    這一點違反直覺，是實測才發現的。
 3. **離群通道保 fp16 的投報率極高**：多 3% 頻寬換來 argmax 一致率從 85% 拉到 99.3%。
 
-若不想處理混合精度，`group-64` 是最好的純 int8 選項（+0.48%，零額外頻寬）。
+若不想處理混合精度，`group-64` 是最好的純 int8 選項（+0.48%）。
+
+> 「零額外頻寬」也是錯的：group-64 每個 token、每 64 個 channel 各要一個 scale，
+> 所以是 8.25 bits/值（fp16 scale）而不是 8.0。它仍然是最省的選項，
+> 但不是因為原本說的理由。
 
 ### 4.3 量化誤差會隨 hop 數累積（次線性）
 
@@ -185,13 +203,183 @@ hop 數增加 14 倍，最佳方案的**不一致率**只放大約 2.8 倍。
 
 ### 4.4 傳輸層
 
-WebRTC DataChannel（reliable + ordered）。注意：
+WebRTC DataChannel（reliable + ordered）。以下每一項都在容器裡用兩個
+Playwright browser context 實測過，不是照抄規格書：
 
-- 單則訊息上限 **256 KiB** → 大 K 需應用層分片
-- 用 `bufferedAmount` 做背壓，不要無上限塞
-- NAT 直連會失敗一定比例 → **必須有 TURN fallback**
+**單則訊息上限是協商出來的，不是常數。** 讀 `pc.sctp.maxMessageSize`，
+不要寫死 256 KiB。實測 Chromium 對 Chromium 是 262144；兩個 Firefox 之間是
+1073741823；對方若沒在 SDP 裡宣告 `a=max-message-size`，依 RFC 8841 是 65536。
+
+**超過上限不會丟例外，會非同步殺掉整個 channel。** 實測：單次 `send()` 一個
+3,145,728 位元組的訊息**沒有**丟 TypeError（與 W3C 的 send() 演算法描述不符），
+正常返回，然後非同步觸發
+`error { name: 'OperationError', errorDetail: 'data-channel-failure' }` 並關閉，
+0 位元組送達。**這是這一層最危險的失敗模式**，因為它看起來像對方斷線。
+
+**但 `bufferedAmount` 堆高本身是安全的。** 同樣實測：用 16 KiB 分塊、完全不做
+背壓，堆到 3,145,728 沒事，繼續堆到 16,777,216 也沒事 —— 到 16 MiB 時
+`send()` 丟出**可以 catch 的** `OperationError`，channel 仍是 `open`。
+（先前根據 dcSCTP 原始碼推測的「2 MB 送出佇列會殺掉 channel」**沒有重現**。
+推測不能當實測用，這裡記下來。）
+
+所以正確的規則只有一條：**永遠不要送出單一則大於 `maxMessageSize` 的訊息。**
+分塊之後背壓是為了控制記憶體，不是為了避免 channel 被殺。
+
+**分塊用 16384 位元組**，不是用 `maxMessageSize`。理由不是訊息上限，是
+head-of-line blocking —— RFC 8260 的 ndata 在 Chrome 是關閉的、在 Firefox
+未實作（bugzilla 1381145），所以一則大訊息在途中會獨佔整個 association。
+16 KiB 是 libp2p、webrtc samples、PeerJS 各自收斂到的同一個值。
+
+**不要傳 `maxRetransmits` 或 `maxPacketLifeTime`。** 部分可靠傳輸在 dcSCTP
+是啟用的，誤設會讓分片被靜默丟棄而不是報錯 —— 掉一塊就整個張量壞掉。
+兩個一起傳會丟例外。
+
+**兩邊都要明確設 `binaryType = 'arraybuffer'`**，包含 `ondatachannel` 收到的
+那一個 —— 各家引擎的預設值歷史上並不一致。
+
+**M3 用不到 STUN 也用不到 TURN。** 同一台機器的兩個分頁走 loopback candidate，
+同一個區域網路的兩台裝置走 host / mDNS candidate，全程不接觸任何第三方。
+公網穿透與 TURN 是 M6 的事。
 
 > TURN 是一個中心化元件。架構文件不應宣稱「完全去中心化」。
+> 但也不該把 TURN 寫成每個里程碑都需要 —— M3 不需要。
+
+---
+
+### 4.5 Frame 格式（M3 制定）
+
+> 本節之前不存在。§4.1–4.4 講的是「傳什麼、多大、用什麼傳」，
+> 但沒有任何位元組層級的定義 —— 沒有 header、沒有版本、沒有序號、
+> 沒有分片框架、沒有端序、沒有訊息型別、沒有回程路徑的定義。
+> M3 不是在實作一個既有格式，是在制定一個。
+
+#### 4.5.1 兩層結構
+
+| 層 | 負責 | 實作 |
+|---|---|---|
+| **frame** | 一則語意完整的訊息（一次交接的激活值，或回程的 logits）| `web/src/wire.js` |
+| **chunk** | 把 frame 切成 16 KiB 送出、在對面重組 | `web/src/dcframe.js` |
+
+分片在 frame **底下**，所以 frame 層完全不必知道 DataChannel 的存在，
+可以用假的 channel 單元測試。
+
+#### 4.5.2 Frame header（固定 32 位元組，little-endian）
+
+端序一律 little-endian，明確寫死，不依賴平台。
+
+| 位移 | 大小 | 欄位 | 說明 |
+|---|---|---|---|
+| 0 | 4 | `magic` | `0x314C4345`（`'ECL1'`）|
+| 4 | 1 | `version` | 目前是 1 |
+| 5 | 1 | `msgType` | 0=激活值 1=logits 2=控制 |
+| 6 | 1 | `schemeId` | 0=none 1=per-channel 2=group-64 3=per-ch+outlier |
+| 7 | 1 | `flags` | bit0：scale 用 fp16（0=fp32）。其餘保留為 0 |
+| 8 | 4 | `roundId` | 這是第幾次 traversal |
+| 12 | 1 | `stageIndex` | 產生這則訊息的 shard 序號 |
+| 13 | 1 | — | 保留，0 |
+| 14 | 2 | `dModel` | |
+| 16 | 2 | `qLen` | 這則訊息裡有幾個 token 位置（即 K）|
+| 18 | 4 | `startPosition` | 第一個 token 的**絕對**位置 |
+| 22 | 2 | `scaleCount` | scale 區塊有幾個值 |
+| 24 | 2 | `outlierCount` | 離群索引區塊有幾個值 |
+| 26 | 4 | `payloadLen` | header 之後的位元組數 |
+| 30 | 2 | — | 保留，0（湊滿 32，維持 4 位元組對齊）|
+
+`scaleCount` 與 `outlierCount` **必須明確帶在 header 裡**，不能讓接收端從
+`dModel` 與某個約定的 `outlierFrac` 反推。理由：離群比例是呼叫端參數
+（`quant.js` 是 0.03、Python 版是 0.01），而且兩個方案的 scale 數量規則不同
+（per-channel 是 `d`、group-64 是 `K × ceil(d/64)`）。少了這兩個欄位，
+接收端找不到 payload 的邊界。
+
+#### 4.5.3 `startPosition` / `qLen`：M3 用不到，但現在就要有
+
+M3 沒有 KV cache，所以每次 traversal 都從位置 0 重算，`startPosition` 恆為 0。
+**還是要送。** 成本是每則訊息 6 個位元組；不送的代價是 M5 要改協定版本。
+
+這正是 Petals 的作法：client 把 `start_from_position` 放進**每一則**推論請求的
+metadata，server 據此設定 `prefix_length`
+（`inference_session.py:134-135`、`block_functions.py:163-168`）。
+回滾因此是 O(1)、冪等、可重放，而且不需要另外的控制訊息。
+
+現在的程式碼在每個節點各自重算 `arange(0..seqLen)` 當 position_ids
+（`web/src/runner.js:271-272`）。那只在「每次都從 0 重算」時才正確 ——
+KV cache 或投機解碼一落地，各節點就會靜默地對不上。所以位置要**跟著 frame 走**。
+
+> Petals 自己的那個斷言寫錯了：`block_functions.py:165-167` 斷言的是
+> 一個單元素 tuple，永遠為真，所以 client 送出往前跳的位置會靜默汙染快取。
+> 我們要加的是真正的單調性檢查。
+
+#### 4.5.4 Payload 佈局
+
+區塊順序刻意讓**所有 ≥2 位元組的區塊排在前面、1 位元組的 int8 本體排最後**，
+這樣 `Uint16Array` / `Float32Array` 視圖都能直接建在對齊位置上，不用複製。
+
+本體一律 token-major（t 外層、c 內層），對應 `x[t * dModel + c]`。
+
+| schemeId | payload |
+|---|---|
+| 0 `none` | fp32 本體：`d × K × 4` |
+| 1 `per-channel` | scale 區塊 `d × S`，然後 int8 本體 `d × K` |
+| 2 `group-64` | scale 區塊 `K × ceil(d/64) × S`，然後 int8 本體 `d × K` |
+| 3 `per-ch+outlier` | 離群索引 `nOut × u16`，scale 區塊 `(d − nOut) × S`，fp16 離群本體 `nOut × K × 2`，最後 int8 本體 `(d − nOut) × K` |
+
+S 是 scale 的位元組數（flags bit0：fp16=2、fp32=4）。
+
+方案 3 的 int8 本體只含**非離群** channel，依 channel 索引遞增排列；
+離群 channel 的值放在 fp16 區塊，順序與索引區塊一致。
+接收端用索引區塊重建一張 `isOutlier` 表，然後逐 channel 還原。
+
+#### 4.5.5 規範性語意：用「送出去的那個 scale」量化
+
+編碼端**必須**先把 scale 轉成它要送出的精度（預設 fp16），**再**用那個值做量化。
+
+否則 `decode(encode(x))` 不會等於編碼端自己算的結果 —— 編碼端用 fp32 scale
+量化、解碼端用 fp16 scale 還原，兩邊差一個 scale 的捨入誤差。
+先轉再量化就沒有這個問題，而且解碼端不需要知道原始 fp32 scale。
+
+這條規則讓 `wire.js` 自洽。它與 `quant.js` 的關係則是：
+**`quant.js` 是 M4 的品質模擬器，不是線路格式的實作。**
+`quant.js` 的 `SCHEMES.fn` 回傳 `Float32Array`（量化→反量化的往返），
+從來沒有產生過任何位元組。兩者的綁定測試是「fp32 scale 時逐位元相等、
+fp16 scale 時相對誤差 < 2⁻¹⁰」，而不是無條件相等。
+
+#### 4.5.6 Chunk 子標頭（8 位元組，little-endian）
+
+每個 chunk 前面加：
+
+| 位移 | 大小 | 欄位 |
+|---|---|---|
+| 0 | 4 | `messageId` u32 |
+| 4 | 2 | `chunkIndex` u16 |
+| 6 | 2 | `chunkCount` u16 |
+
+所以每個 chunk 實際送出 8 + 最多 16376 位元組，總長不超過 16384。
+
+#### 4.5.7 回程：最後一段不在頭節點時送什麼
+
+**送完整的 fp32 logits，分塊 + 背壓。**
+
+M3 的驗收標準要比對所有位置的 logits，所以需要完整 logits ——
+回傳 top-k 會讓驗收測試變弱。而這也正好是壓力測試要的：
+`vocab_size` 49152 × seq 16 × 4 位元組 = **3,145,728 位元組**，
+遠超過協商出來的 262144 上限，所以它一定要走分塊路徑。
+直接 `send()` 會照 §4.4 描述的方式非同步殺掉 channel。
+
+預設拓撲讓頭節點同時持有第一段與最後一段（見 §4.5.8），
+所以 logits 根本不過線。回程路徑只在壓力測試的拓撲下才會用到 ——
+但它必須存在，而且 `msgType = 1` 現在就要佔位，
+這樣之後改成 top-k 表示法不需要升版本。
+
+#### 4.5.8 M3 的拓撲
+
+4 段分給 2 個分頁：**頭節點持有 {0, 3}，對等節點持有 {1, 2}。**
+
+§1 已經允許頭節點同時承擔一段。這個切法給出真正的環狀 A→B→A、
+兩次跨線，而且兩次跨的都是小的激活值；logits 在頭節點內部產生，不過線 ——
+與 §4.1「logits 直接在頭節點用」一致。
+
+另外保留一個設定旗標 `{0,1} / {2,3}`，**只給壓力測試用**：
+那個切法會讓 3 MiB 的 fp32 logits 真的跨線，把分塊與背壓路徑跑到。
 
 ---
 
