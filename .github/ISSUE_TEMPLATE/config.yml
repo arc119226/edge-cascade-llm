@@ -1,0 +1,11 @@
+# 關掉空白 issue，是為了讓裝置回報的資料是結構化的 —— 之後要把十幾台裝置的
+# 數字放在一起比較，散在自由格式的文字裡會很難撈。
+# 但不想因此把人擋在外面，所以下面留了一條到 Discussions 的路。
+blank_issues_enabled: false
+contact_links:
+  - name: 想問問題、或只是想聊聊
+    url: https://github.com/arc119226/edge-cascade-llm/discussions
+    about: 不確定算不算錯誤、想問架構為什麼這樣設計、或有想法想討論 —— 這裡比開 issue 輕鬆。
+  - name: 先看看技術文件
+    url: https://github.com/arc119226/edge-cascade-llm/tree/main/docs
+    about: 可行性評估、架構規格、開發路線、以及一份「已知的未知數」清單。

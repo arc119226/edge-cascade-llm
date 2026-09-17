@@ -34,6 +34,12 @@
   }
   button:disabled { opacity: .5; cursor: default; }
   button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  /* 回報連結要長得像按鈕，但它必須是 <a> —— 這樣才能中鍵開新分頁、複製網址。 */
+  .btn-link {
+    display: inline-block; background: transparent; color: var(--accent);
+    border: 1px solid var(--line); border-radius: 8px; padding: 12px 20px;
+    font-size: 16px; font-weight: 600; text-decoration: none;
+  }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
   th { color: var(--dim); font-weight: 500; }
@@ -94,10 +100,17 @@
   <div class="card" id="report-card" hidden>
     <strong>3. 把結果貼回來</strong>
     <div class="dim" style="font-size:14px; margin-bottom:8px">
-      按複製，然後貼到 GitHub issue 或直接傳給我們
+      按「複製結果」，再按「開回報表單」，把它貼進最後那一欄就好。
+      表單會多問幾個 JSON 裡沒有的東西（機型、是不是插著電）——
+      筆電用電池時顯示卡會降頻，同一台機器的數字可能差好幾倍。
     </div>
     <div class="row">
       <button id="btn-copy">複製結果</button>
+      <!-- 不用 ?body= 預填：一份報告 JSON 有好幾 KB，URL 編碼後會撐破
+           GitHub 的長度上限，而且失敗時是靜默截斷。讓使用者自己貼比較可靠。 -->
+      <a class="btn-link" id="btn-report" target="_blank" rel="noopener"
+         href="https://github.com/arc119226/edge-cascade-llm/issues/new?template=device-report.yml"
+      >開回報表單</a>
       <button class="secondary" id="btn-download">下載成檔案</button>
       <span id="copy-msg" class="ok"></span>
     </div>
