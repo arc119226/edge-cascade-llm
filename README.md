@@ -137,7 +137,7 @@ flowchart TB
 | M0 | 這樣做理論上跑多快？ | ✅ 完成 |
 | M1 | 把模型切開，結果還對嗎？ | ✅ **完成，結果完全正確** |
 | M4 | 壓縮中間結果會不會失真？ | ✅ 完成，找到可用的壓縮方式 |
-| M2 | 在瀏覽器裡跑得起來嗎？ | ✅ 完成（真實顯示卡的效能待實測） |
+| M2 | 在瀏覽器裡跑得起來嗎？ | ✅ 完成，且可部署（真實顯示卡效能待實測） |
 | M3 | 多台裝置真的連起來 | ⬜ 下一步 |
 | M5 | 加上「猜字」加速 | ⬜ 還沒做 |
 | M6–M7 | 自動配對、斷線接手 | ⬜ 還沒做 |
@@ -147,6 +147,8 @@ flowchart TB
 - 把模型切成 2、4、8、15 段，算出來的結果**完全一樣** —— 切分本身不會讓模型變笨
 - 中間結果可以壓到約 1/4 大小，品質只掉 **0.03%**
 - 但壓縮方法要選對：用錯的方法會讓模型直接壞掉（困惑度從 13.8 暴增到 4208）
+- 權重量化到 8-bit 沒問題，但 **4-bit 會讓這個 135M 小模型壞掉**
+  （選字正確率從 15/16 掉到 3/16）—— 小模型對低位元特別敏感
 
 ---
 
@@ -168,13 +170,17 @@ python3 bench/model.py --model 32b --nodes 4
 
 # 驗證「把模型切開結果還對嗎」
 pip install torch transformers onnx onnxruntime onnxscript
-python3 spike/export_shards.py --model HuggingFaceTB/SmolLM2-135M --shards 4 --out out/ --seed 42
+python3 spike/export_shards.py --model HuggingFaceTB/SmolLM2-135M \
+        --shards 4 --dtype int4 --out out/ --seed 42
 python3 spike/verify_shards.py --dir out/
 
 # 在瀏覽器裡跑
 cd web && npm ci && npm run build && node scripts/prepare-model.mjs
 npm test        # 用 headless 瀏覽器驗證整條流水線
 npm run dev     # 開 http://localhost:8080 自己玩
+
+# 部署到 Cloudflare（不需要付款方式，見 docs/DEPLOY.md）
+npx wrangler deploy
 ```
 
 ---
@@ -185,7 +191,7 @@ npm run dev     # 開 http://localhost:8080 自己玩
 
 | 文件 | 內容 |
 |---|---|
-| [部署指南](docs/DEPLOY.md) | 怎麼部署到 Cloudflare Pages + R2 |
+| [部署指南](docs/DEPLOY.md) | 怎麼部署到 Cloudflare Workers（免付款方式） |
 | [可行性評估](docs/00-feasibility.md) | 量化模型、實測數據、困難點清單 |
 | [架構規格](docs/01-architecture.md) | 解碼協定、線路格式、容錯設計 |
 | [開發路線](docs/02-roadmap.md) | 里程碑與驗收條件 |

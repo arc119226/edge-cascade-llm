@@ -23,7 +23,7 @@
  *   Build command           npm ci && npm run build -- --assets-url=<你的 R2 網址>
  *   Build output directory  dist
  */
-import { cp, mkdir, rm, readdir, writeFile, stat } from 'node:fs/promises';
+import { cp, mkdir, rm, readdir, writeFile, readFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 
@@ -31,6 +31,22 @@ const MAX_PAGES_FILE_BYTES = 25 * 1024 * 1024; // Cloudflare Pages 單檔上限
 
 const argv = process.argv.slice(2);
 const assetsUrl = argv.find((a) => a.startsWith('--assets-url='))?.split('=').slice(1).join('=');
+// 預設「不」開 cross-origin isolation（WASM 多執行緒的前提）。
+//
+// 已查證：jsDelivr 的 .mjs 與 .wasm 都有帶
+// `cross-origin-resource-policy: cross-origin`，所以 CORP 本身不是問題。
+// 保守不開的理由是另一個：ORT 在多執行緒模式下會用 wasm 模組的 URL 去建
+// Worker，而跨來源建 Worker 是受限的（transformers.js #1527 有同樣症狀）。
+// 這一點尚未實測確認，所以預設走安全的單執行緒。
+//
+// 影響有限：多執行緒只加速 WASM 後端，WebGPU 不受影響，
+// 而這個量測工具要量的正是 WebGPU。
+// 要試多執行緒就加 --cross-origin-isolated（會自動改成同源 wasm，
+// 屆時得自己處理 25 MiB 單檔上限，見 docs/DEPLOY.md）。
+const crossOriginIsolated = argv.includes('--cross-origin-isolated');
+// 把 wasm 放在同源。測試要用（不能依賴外部網路），
+// 開 cross-origin isolation 時也會自動開啟。
+const selfHostFlag = argv.includes('--self-host-wasm');
 
 const root = path.resolve(import.meta.dirname, '..');
 const dist = path.join(root, 'dist');
@@ -41,7 +57,7 @@ await rm(assetsOut, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
 
 // 1. 靜態頁面與原始碼
-for (const f of ['index.html', 'bench.html', 'manifest.webmanifest', 'sw.js', '_headers']) {
+for (const f of ['index.html', 'bench.html', 'manifest.webmanifest', 'sw.js']) {
   if (existsSync(path.join(root, f))) await cp(path.join(root, f), path.join(dist, f));
 }
 await cp(path.join(root, 'src'), path.join(dist, 'src'), { recursive: true });
@@ -57,6 +73,19 @@ if (!existsSync(ortDist)) {
   process.exit(1);
 }
 
+const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
+const ortVersion = JSON.parse(
+  await readFile(path.join(root, 'node_modules', 'onnxruntime-web', 'package.json'), 'utf8'),
+).version;
+
+// wasm 執行檔的來源，三選一：
+//   1. --assets-url 指定的位置（例如 R2）
+//   2. 沒指定時走 jsDelivr —— 零設定，但與 COOP/COEP 互斥
+//   3. --cross-origin-isolated 時強制同源（就得自己解決 25 MiB 問題）
+const jsdelivr = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ortVersion}/dist/`;
+const selfHostWasm = !assetsUrl && (crossOriginIsolated || selfHostFlag);
+const wasmSource = assetsUrl ?? (selfHostWasm ? './ort/' : jsdelivr);
+
 const ortOut = path.join(dist, 'ort');
 await mkdir(ortOut, { recursive: true });
 
@@ -65,13 +94,15 @@ let inDist = 0, distBytes = 0;
 
 for (const f of await readdir(ortDist)) {
   if (!/\.(wasm|mjs)$/.test(f)) continue;
-  // .mjs 只留我們實際會 import 的入口與它的 loader 夥伴
   if (f.endsWith('.mjs') && !/^ort\.webgpu\.mjs$|^ort-wasm-simd-threaded\./.test(f)) continue;
 
   const src = path.join(ortDist, f);
   const size = (await stat(src)).size;
 
-  if (assetsUrl && size > MAX_PAGES_FILE_BYTES) {
+  // 走 CDN 時 .wasm 不必進 dist（入口 .mjs 仍要，因為我們是 import 它）
+  if (!selfHostWasm && !assetsUrl && f.endsWith('.wasm')) continue;
+
+  if ((assetsUrl || !selfHostWasm) && size > MAX_PAGES_FILE_BYTES) {
     await mkdir(assetsOut, { recursive: true });
     await cp(src, path.join(assetsOut, f));
     oversized.push({ f, size });
@@ -82,11 +113,46 @@ for (const f of await readdir(ortDist)) {
   }
 }
 
+// _headers 由建置產生，而不是直接複製 —— COOP/COEP 是條件性的
+const headerLines = [
+  '# 由 scripts/build.mjs 產生，不要手動改。',
+  '',
+];
+if (crossOriginIsolated) {
+  headerLines.push(
+    '# cross-origin isolation：WASM 多執行緒（SharedArrayBuffer）的前提。',
+    '# 代價是所有跨來源資源都必須帶 CORP 標頭。',
+    '/*',
+    '  Cross-Origin-Opener-Policy: same-origin',
+    '  Cross-Origin-Embedder-Policy: require-corp',
+    '',
+  );
+}
+headerLines.push(
+  '# wasm 與模型權重都是不可變內容，讓瀏覽器與 CDN 盡量長期保存',
+  '/ort/*',
+  '  Cache-Control: public, max-age=31536000, immutable',
+  '',
+  '/model/*',
+  '  Cache-Control: public, max-age=31536000, immutable',
+  '',
+  '# service worker 不能被快取，否則更新推不出去',
+  '/sw.js',
+  '  Cache-Control: no-cache',
+  '',
+);
+await writeFile(path.join(dist, '_headers'), headerLines.join('\n'));
+
 // 3. 執行期設定：告訴前端去哪裡載 wasm。
 //    寫成獨立檔案而不是編進 JS，這樣同一份建置可以換不同的 assets 來源。
 await writeFile(
   path.join(dist, 'config.json'),
-  JSON.stringify({ wasmPaths: assetsUrl ?? './ort/', builtAt: new Date().toISOString() }, null, 2),
+  JSON.stringify({
+    wasmPaths: wasmSource,
+    ortVersion,
+    crossOriginIsolated,
+    builtAt: new Date().toISOString(),
+  }, null, 2),
 );
 
 // 4. 給 service worker 的預快取清單（只含程式碼，不含模型權重）
@@ -119,7 +185,8 @@ await checkSizes(dist);
 console.log('dist/ 建置完成');
 console.log(`  ORT 執行檔 ${inDist} 個（${(distBytes / 1e6).toFixed(1)} MB）`);
 console.log(`  app shell ${shell.length} 個檔案`);
-console.log(`  wasm 載入來源：${assetsUrl ?? './ort/（同源）'}`);
+console.log(`  wasm 載入來源：${selfHostWasm ? './ort/（同源）' : wasmSource}`);
+console.log(`  cross-origin isolation：${crossOriginIsolated ? '開啟（WASM 可多執行緒）' : '關閉（WASM 單執行緒，WebGPU 不受影響）'}`);
 
 if (oversized.length) {
   const mb = oversized.reduce((a, o) => a + o.size, 0) / 1e6;

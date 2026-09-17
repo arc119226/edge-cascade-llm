@@ -1,0 +1,26 @@
+{
+  // Cloudflare Workers 靜態資產設定。
+  //
+  // 為什麼是 Workers 而不是 Pages：Pages 已進入維護模式，
+  // 官方對新專案建議 Workers。兩者的靜態資產都有 25 MiB 單檔上限，
+  // 所以換過來不是為了解決大檔問題（那靠 scripts/prepare-model.mjs 分塊）。
+  //
+  // 部署：
+  //   npx wrangler deploy
+  // 或在 Cloudflare 主控台接 GitHub 自動部署，設定見 docs/DEPLOY.md。
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "edge-cascade-llm",
+  "compatibility_date": "2026-09-01",
+
+  "assets": {
+    "directory": "./dist",
+    // 這是純靜態站，沒有 SPA 路由，所以走 404 而不是 single-page-application。
+    // 用 SPA 模式的話，打錯的模型檔路徑會回傳 index.html 而不是 404，
+    // ONNX 會拿到一段 HTML 當成模型去解析，錯誤訊息會完全看不出原因。
+    "not_found_handling": "404-page"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

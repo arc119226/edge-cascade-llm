@@ -56,7 +56,8 @@ $('btn-env').onclick = async () => {
     rows.push(['CPU 核心數', environment.hardwareConcurrency ?? '（未提供）']);
     rows.push(['多執行緒', environment.crossOriginIsolated
       ? '<span class="ok">已啟用</span>'
-      : '<span class="warn">未啟用</span><span class="dim">　缺 COOP/COEP 標頭，會單緒跑</span>']);
+      : '<span class="ok">未啟用（正常）</span>'
+        + '<span class="dim">　這是預設設定，只影響 WASM 後端，不影響 WebGPU</span>']);
     if (q) {
       rows.push(['可用儲存空間', `${fmtBytes(q.free)} <span class="dim">／ 共 ${fmtBytes(q.quota)}</span>`]);
     }

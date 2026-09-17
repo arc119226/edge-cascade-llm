@@ -112,6 +112,171 @@ def _run_layer(layer, hidden, mask, position_ids, pos_emb):
     return out[0] if isinstance(out, tuple) else out
 
 
+def shard_bytes(path: Path) -> int:
+    """一個 shard 佔多少位元組（含 external data 旁檔）。"""
+    total = path.stat().st_size
+    ext = path.with_name(path.name + ".data")
+    if ext.exists():
+        total += ext.stat().st_size
+    return total
+
+
+def save_with_external_data(model, path: Path) -> None:
+    """把模型連同 external data 存回原路徑。
+
+    ⚠️ 必須先刪掉舊的 .data 檔。ONNX 的 save_model 不會截斷既有的旁檔，
+    而是接著寫下去 —— 所以「載入 → 量化 → 存回同一路徑」會讓檔案
+    變成「舊的 fp32 權重 + 新的 int4 權重」，反而更大。
+    實測：初始化張量只有 16.3 MB，檔案卻是 131 MB。
+    """
+    import onnx
+
+    ext = path.with_name(path.name + ".data")
+    if ext.exists():
+        ext.unlink()
+    onnx.save_model(
+        model, str(path),
+        save_as_external_data=True, all_tensors_to_one_file=True,
+        location=ext.name, size_threshold=1024,
+    )
+
+
+def embedding_to_fp16(model, min_bytes: int = 8 << 20) -> int:
+    """把大型 embedding 查表（Gather 的 data）從 fp32 降成 fp16。
+
+    為什麼要單獨處理：MatMulNBitsQuantizer 只量化 MatMul，
+    embedding 是 Gather，完全不在它的範圍內。而 SmolLM2-135M 的
+    embedding（vocab 49152 × 576）光自己就有 28.3M 參數 = 113 MB fp32，
+    量化完之後反而變成整個模型最大的一塊。
+
+    作法：initializer 存成 fp16，然後在 Gather 的輸出後面插一個 Cast 轉回 fp32，
+    這樣下游的算子完全不用改。精度影響可忽略 —— embedding 查表出來的值
+    本來就會馬上進 LayerNorm。
+
+    回傳降轉了幾個張量。
+    """
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper, TensorProto
+
+    inits = {i.name: i for i in model.graph.initializer}
+    converted = 0
+
+    for node in list(model.graph.node):
+        if node.op_type != "Gather" or not node.input:
+            continue
+        init = inits.get(node.input[0])
+        if init is None or init.data_type != TensorProto.FLOAT:
+            continue
+        arr = numpy_helper.to_array(init)
+        if arr.nbytes < min_bytes:
+            continue
+
+        # 1. initializer 改成 fp16
+        new_init = numpy_helper.from_array(arr.astype(np.float16), init.name)
+        init.CopyFrom(new_init)
+
+        # 2. Gather 的輸出接一個 Cast 轉回 fp32，下游不用動
+        gather_out = node.output[0]
+        cast_out = gather_out + "_to_fp32"
+        for consumer in model.graph.node:
+            if consumer is node:
+                continue
+            for k, inp in enumerate(consumer.input):
+                if inp == gather_out:
+                    consumer.input[k] = cast_out
+        for out in model.graph.output:
+            if out.name == gather_out:
+                out.name = cast_out
+
+        cast = helper.make_node("Cast", [gather_out], [cast_out],
+                                to=TensorProto.FLOAT,
+                                name=f"{node.name or gather_out}_cast_fp32")
+        idx = list(model.graph.node).index(node)
+        model.graph.node.insert(idx + 1, cast)
+
+        # 3. 型別宣告也要跟著改，否則 ORT 會在載入時就拒絕：
+        #    "Type (tensor(float)) of output arg does not match expected type (tensor(float16))"
+        #    Gather 現在輸出 fp16，Cast 之後才是 fp32。
+        for vi in model.graph.value_info:
+            if vi.name == gather_out:
+                vi.type.tensor_type.elem_type = TensorProto.FLOAT16
+                new_vi = TensorProto  # 佔位，避免 linter 誤判未使用
+                break
+        cast_vi = helper.make_tensor_value_info(cast_out, TensorProto.FLOAT, None)
+        model.graph.value_info.append(cast_vi)
+
+        converted += 1
+
+    return converted
+
+
+def prune_orphan_initializers(model) -> int:
+    """移除沒有任何節點引用的 initializer，回傳清掉幾個。
+
+    量化與圖改寫之後很容易留下孤兒權重。ONNX 不會自動清，
+    而 save_model 會照單全收，所以檔案會莫名其妙變大。
+    """
+    used = set()
+    for node in model.graph.node:
+        used.update(node.input)
+        # 子圖（If / Loop 的 branch）裡的引用也要算
+        for attr in node.attribute:
+            for g in list(attr.graphs) + ([attr.g] if attr.HasField("g") else []):
+                for sub in g.node:
+                    used.update(sub.input)
+    used.update(o.name for o in model.graph.output)
+
+    keep = [init for init in model.graph.initializer if init.name in used]
+    removed = len(model.graph.initializer) - len(keep)
+    if removed:
+        del model.graph.initializer[:]
+        model.graph.initializer.extend(keep)
+        # graph input 若對應已刪除的 initializer 也要一併移除
+        inputs = [i for i in model.graph.input if i.name in used]
+        if len(inputs) != len(model.graph.input):
+            del model.graph.input[:]
+            model.graph.input.extend(inputs)
+    return removed
+
+
+def quantize_nbits(path: Path, bits: int, block_size: int, symmetric: bool):
+    """就地把一個 ONNX 檔的 MatMul 權重量化成 int4（區塊量化）。
+
+    只動 MatMul —— embedding 的 Gather 不在範圍內，會留在原精度。
+    這是為什麼光靠 int4 仍然塞不進 Cloudflare 的 25 MiB 單檔上限：
+    SmolLM2-135M 的 embedding（含 tied lm_head）就佔了 28.3M 參數。
+    大檔分塊因此是必要的，不是選項。
+    """
+    from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
+    import onnx
+
+    model = onnx.load(str(path))
+    # block_size / is_symmetric 是 quantizer 自己的參數，不是 algo_config 的。
+    # 區塊 128：每 128 個權重共用一組 scale，是 MatMulNBits 的常見設定。
+    quant = MatMulNBitsQuantizer(model, bits=bits, block_size=block_size,
+                                 is_symmetric=symmetric)
+    quant.process()
+    # 量化器把 MatMul 換成 MatMulNBits，但**原本的 fp32 權重仍留在 graph 裡**
+    # 變成沒人引用的孤兒 initializer，而 onnx.save 會把它們一起寫出去。
+    # 不清掉的話檔案反而會比量化前更大（實測 217MB -> 357MB）。
+    removed = prune_orphan_initializers(quant.model.model)
+    # embedding 是 Gather，量化器碰不到，要另外降成 fp16。
+    embeds = embedding_to_fp16(quant.model.model)
+    save_with_external_data(quant.model.model, path)
+    return removed, embeds
+
+
+def to_fp16(path: Path) -> None:
+    """就地把一個 ONNX 檔轉成 fp16。int4 跑不起來時的退路。"""
+    import onnx
+    from onnxconverter_common import float16
+
+    model = onnx.load(str(path))
+    model = float16.convert_float_to_float16(model, keep_io_types=True)
+    save_with_external_data(model, path)
+
+
 def split_points(n_layers: int, n_shards: int) -> list[tuple[int, int]]:
     """把 n_layers 平均分成 n_shards 段，餘數分給前面幾段。"""
     if n_shards > n_layers:
@@ -134,6 +299,19 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0,
                     help="隨機輸入的種子。比較不同組態（例如不同 shard 數）時務必固定，"
                          "否則量到的是輸入差異而不是組態差異。")
+    ap.add_argument("--dtype", default="fp32", choices=("fp32", "fp16", "int4"),
+                    help="權重精度。int4 用 MatMulNBitsQuantizer，模型從 591MB 降到約 74MB。\n"
+                         "注意這不只是省空間：roofline 的 K* 與『每參數位元組』成正比，\n"
+                         "拿 fp32 量出來的 K* 會是 int4 實際部署時的 8 倍，沒有參考價值。")
+    ap.add_argument("--quant-bits", type=int, default=8, choices=(4, 8),
+                    help="量化位元數。預設 8。\n"
+                         "⚠️ 小模型對 4-bit 極度敏感：SmolLM2-135M 在 4-bit 下\n"
+                         "argmax 只剩 3/16（等於壞掉），8-bit 則有 15/16。\n"
+                         "大模型（7B 以上）通常撐得住 4-bit，屆時再調。")
+    ap.add_argument("--quant-block", type=int, default=128,
+                    help="量化區塊大小。越小品質越好、額外的 scale 越多。")
+    ap.add_argument("--quant-symmetric", action="store_true",
+                    help="用對稱量化（省一點空間但品質較差）。預設非對稱。")
     ap.add_argument("--opset", type=int, default=18,
                     help="ONNX opset。預設 18 是 torch.onnx 匯出器原生產出的版本；"
                          "指定更低的版本會觸發一次註定失敗的降版轉換（只是噪音，不影響結果）。")
@@ -169,6 +347,13 @@ def main() -> None:
         "vocab_size": cfg.vocab_size,
         "num_shards": args.shards,
         "bounds": bounds,
+        # 記下權重精度：K* 與「每參數位元組」成正比，
+        # 量測報告必須連同這個值一起看才有意義。
+        "dtype": args.dtype if args.dtype != "int4" else f"int{args.quant_bits}",
+        "bytes_per_param": (
+            {"fp32": 4.0, "fp16": 2.0}[args.dtype] if args.dtype != "int4"
+            else args.quant_bits / 8
+        ),
         "shards": [],
     }
 
@@ -206,26 +391,52 @@ def main() -> None:
             )
 
             # 把這個 shard 的真實輸出接給下一個 shard，確保匯出時的樣本輸入是真的
+            # （必須在量化「之前」算，因為參考值要對照未量化的 PyTorch 模型）
             hidden = mod(*sample)
 
-            size_mb = path.stat().st_size / 1e6
+            if args.dtype == "int4":
+                pruned, embeds = quantize_nbits(
+                    path, args.quant_bits, args.quant_block, args.quant_symmetric)
+            elif args.dtype == "fp16":
+                to_fp16(path)
+
+            size_mb = shard_bytes(path) / 1e6
             manifest["shards"].append({
                 "index": i, "file": path.name, "layers": [a, b],
                 "input": in_names[0], "output": out_name,
                 "size_mb": round(size_mb, 1),
             })
-            print(f"  shard {i}: 層 {a}–{b}  ->  {path.name}  ({size_mb:.1f} MB)")
+            extra = ""
+            if args.dtype == "int4":
+                bits = []
+                if pruned:
+                    bits.append(f"清掉 {pruned} 個孤兒權重")
+                if embeds:
+                    bits.append(f"{embeds} 個 embedding 降 fp16")
+                extra = ("，" + "、".join(bits)) if bits else ""
+            print(f"  shard {i}: 層 {a}–{b}  ->  {path.name}  ({size_mb:.1f} MB{extra})")
 
     # 存一份未切分模型的參考 logits，給 verify_shards.py 比對
     with torch.no_grad():
         ref = model(input_ids=input_ids, position_ids=position_ids).logits
+
+    # logits 存成 fp16 二進位而不是 JSON 文字。
+    # 786,432 個浮點數存成 JSON 是 14.7 MB，存 fp16 只要 1.5 MB ——
+    # 而且 JSON 版本本身就超過 Cloudflare 的 25 MiB 單檔上限。
+    # fp16 的精度（約 1e-3 相對誤差）遠優於我們要驗的 1e-3 絕對容差，夠用。
+    ref_np = ref.flatten().to(torch.float16).numpy()
+    (out / "reference.bin").write_bytes(ref_np.tobytes())
 
     ref_path = out / "reference.json"
     ref_path.write_text(json.dumps({
         "input_ids": input_ids.tolist(),
         "position_ids": position_ids.tolist(),
         "logits_shape": list(ref.shape),
-        "logits": ref.flatten().tolist(),
+        "logits_file": "reference.bin",
+        "logits_dtype": "float16",
+        # argmax 另外存一份：貪婪解碼真正在意的就是這個，
+        # 而且它讓「有沒有選錯字」可以獨立於浮點誤差來檢查。
+        "argmax": ref.argmax(-1).flatten().tolist(),
     }))
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
