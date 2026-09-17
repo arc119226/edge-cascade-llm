@@ -121,6 +121,55 @@ def shard_bytes(path: Path) -> int:
     return total
 
 
+MIN_TRANSFORMERS = 5
+
+
+def require_transformers_v5() -> str:
+    """確認 transformers 是 v5 以上，否則給出可操作的訊息後結束。
+
+    本專案用 v5 的 API。v4 會在 `from_pretrained` 拒絕 `dtype` 參數，
+    而且錯誤是從 transformers 內部丟出來的，完全看不出根因：
+
+        TypeError: LlamaForCausalLM.__init__() got an unexpected keyword argument 'dtype'
+
+    與其寫相容層讓兩邊都能跑，不如在這裡擋下來講清楚 ——
+    版本太舊多半是因為機器上早就裝過舊版，而 `pip install` 對已安裝的套件
+    不會升級（它只會說 Requirement already satisfied）。
+    """
+    import transformers
+
+    version = transformers.__version__
+    major = int(version.split(".")[0])
+    if major < MIN_TRANSFORMERS:
+        raise SystemExit(
+            f"transformers 版本太舊：目前是 {version}，需要 {MIN_TRANSFORMERS}.0 以上。\n"
+            f"\n"
+            f"  多半是機器上早就裝過舊版 —— `pip install transformers` 對已安裝的\n"
+            f"  套件不會升級，只會說 Requirement already satisfied。\n"
+            f"\n"
+            f"  升級方式：\n"
+            f"    python -m pip install --upgrade transformers\n"
+            f"  或直接跑（會一次處理好所有套件）：\n"
+            f"    cd web && npm run setup"
+        )
+    return version
+
+
+def load_fp32_model(model_id: str):
+    """載入 HF 因果語言模型，權重固定為 fp32。
+
+    fp32 是刻意的：這些權重之後會拿去做量化與數值比對，
+    基準必須是未經降精度的版本，否則「量化造成的誤差」會混進
+    「載入時就已經降精度」的誤差裡，分不開。
+    """
+    from transformers import AutoModelForCausalLM
+
+    require_transformers_v5()
+    return AutoModelForCausalLM.from_pretrained(
+        model_id, dtype=torch.float32, attn_implementation="eager"
+    )
+
+
 def save_with_external_data(model, path: Path) -> None:
     """把模型連同 external data 存回原路徑。
 
@@ -317,16 +366,14 @@ def main() -> None:
                          "指定更低的版本會觸發一次註定失敗的降版轉換（只是噪音，不影響結果）。")
     args = ap.parse_args()
 
-    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers import AutoConfig
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"載入 {args.model} …")
     cfg = AutoConfig.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.float32, attn_implementation="eager"
-    )
+    model = load_fp32_model(args.model)
     model.eval()
 
     n_layers = cfg.num_hidden_layers

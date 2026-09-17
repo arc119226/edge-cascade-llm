@@ -15,7 +15,16 @@
 import path from 'node:path';
 import { findPython, runPython, describe } from './python.mjs';
 
-const PACKAGES = ['torch', 'transformers', 'onnx', 'onnxruntime', 'onnxscript'];
+// transformers 釘在 v5 以上：本專案用 v5 的 API（例如 from_pretrained 的
+// `dtype` 參數，v4 只認得 `torch_dtype`）。不寫相容層，因為 v4 的失敗是從
+// transformers 內部丟出來的 TypeError，看不出根因，不如直接要求正確版本。
+const PACKAGES = [
+  'torch',
+  'transformers>=5',
+  'onnx',
+  'onnxruntime',
+  'onnxscript',
+];
 
 const repo = path.resolve(import.meta.dirname, '..', '..');
 const py = findPython();
@@ -24,7 +33,11 @@ console.log(`使用 ${describe(py)} 安裝：${PACKAGES.join(' ')}`);
 console.log('（走 python -m pip，而不是 pip.exe —— 後者在 Windows 11 上可能被 Smart App Control 擋下）\n');
 
 try {
-  runPython(py, ['-m', 'pip', 'install', ...PACKAGES], repo);
+  // --upgrade 是必要的：`pip install X` 對已安裝的套件會直接說
+  // 「Requirement already satisfied」而不升級。使用者若早就裝過舊版
+  // transformers，就會拿到一個與本專案不相容的版本 ——
+  // 實際踩過：transformers 4.x 不認得 from_pretrained 的 dtype 參數。
+  runPython(py, ['-m', 'pip', 'install', '--upgrade', ...PACKAGES], repo);
 } catch {
   // execFileSync 在子程序失敗時會拋，但 pip 自己的錯誤訊息已經印出來了，
   // 再把 stack trace 疊上去只會蓋掉真正有用的資訊。
