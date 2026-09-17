@@ -24,22 +24,36 @@ Cloudflare 的靜態資產有 **單檔 25 MiB** 上限（Workers 和 Pages 都�
 
 ## 步驟
 
-### 一、先在本機產生模型
-
-模型檔不進版控（太大），所以要先在本機產生一份。
+三行指令，**完全不用打任何 Python 指令**。
+腳本會自己找到你機器上的 Python（`python3` / `python` / `py -3` 都認得），
+也會自己繞過 Windows 的兩個陷阱（Smart App Control、App Execution Alias）。
 
 ```bash
-# 需要 Python 套件
-pip install torch transformers onnx onnxruntime onnxscript
+cd web
+npm ci
+npm run setup      # 裝 Python 套件（torch 等，約 1 GB）
+npm run deploy     # 建置 + 產生模型 + 部署
+```
 
-cd edge-cascade-llm
+`npm run deploy` 會依序做三件事，順序寫死在 script 裡所以你不會弄錯：
 
-# 匯出模型並量化成 int8（約 205 MB）
+1. `npm run build` —— 建置網站（會清空 `dist/`）
+2. `npm run prepare-model` —— 沒有模型就自動匯出、驗證、切片放進 `dist/model/`
+3. `wrangler deploy` —— 部署。第一次會要你登入
+
+第一次跑 `npm run prepare-model` 需要幾分鐘（要下載模型並量化），
+之後 `out/` 裡有東西就會直接沿用。
+
+### 想自己控制匯出參數
+
+只有在你要換模型或調整切分數時才需要手動跑。
+**Windows 請用 `python`，不是 `python3`**（原因見下方 Windows 一節）：
+
+```bash
 python3 spike/export_shards.py \
   --model HuggingFaceTB/SmolLM2-135M \
   --shards 4 --dtype int4 --out out/ --seed 42
 
-# 驗證切分正確，並產生瀏覽器測試要用的對照檔
 python3 spike/verify_shards.py --dir out/
 ```
 
@@ -48,23 +62,24 @@ python3 spike/verify_shards.py --dir out/
 > argmax 只剩 3/16（等於壞掉），8-bit 則有 15/16。
 > 小模型對低位元量化特別敏感；7B 以上的模型通常撐得住 4-bit。
 
-#### Windows 使用者請看這裡
+---
 
-Windows 有兩個地方跟上面的指令不一樣。
+## Windows 的兩個陷阱（`npm run setup` 已經幫你避開）
 
-**1. `pip` 可能被 Smart App Control 擋下**
+這一節是給想理解發生什麼事、或偏好手動執行的人看的。
+照上面三行 npm 指令走的話，不會碰到這兩件事。
 
-如果你看到這個訊息：
+### 陷阱一：`pip` 被 Smart App Control 擋下
 
 ```
 'C:\PythonXXX\Scripts\pip.exe' 已被貴組織的 Device Guard 原則封鎖。
 ```
 
-這是 **Windows 11 的 Smart App Control**（它用 WDAC 實作，所以訊息裡寫 Device Guard）。
-在個人電腦上這是預設行為，**不代表你的電腦被公司管控**。
+這是 **Windows 11 的 Smart App Control**（用 WDAC 實作，所以訊息裡寫 Device Guard）。
+在個人電腦上是預設行為，**不代表你的電腦被公司管控**。
 它會擋掉未簽章的執行檔，而 `pip.exe` 正是 pip 產生的未簽章 .exe 外殼。
 
-解法是改走**已簽章的 `python.exe`**，把 pip 當模組執行：
+手動的解法是走**已簽章的 `python.exe`**：
 
 ```bat
 python -m pip install torch transformers onnx onnxruntime onnxscript
@@ -72,15 +87,30 @@ python -m pip install torch transformers onnx onnxruntime onnxscript
 
 > ⚠️ **不要為了這件事去關掉 Smart App Control。**
 > 它一旦關閉就**無法再開啟** —— 要重灌 Windows 才能恢復。
-> 用上面那行就解決了，不需要動任何安全設定。
 >
 > 想確認是不是它擋的：事件檢視器 →
 > `應用程式及服務記錄檔 > Microsoft > Windows > CodeIntegrity > Operational`，
 > 事件 3033 / 3077 就是封鎖記錄。
 
-**2. 指令叫 `python`，不是 `python3`**
+### 陷阱二：`python3` 是假的
 
-Windows 沒有 `python3` 這個指令。完整的 Windows 版指令：
+```
+Python was not found; run without arguments to install from the Microsoft Store,
+or disable this shortcut from Settings > Apps > Advanced app settings > App execution aliases.
+```
+
+Windows 預裝了叫 `python.exe` / `python3.exe` 的 **App Execution Alias 轉址 stub**。
+執行它**不會**跑你已經裝好的 Python，只會叫你去市集再裝一次 ——
+這個訊息特別誤導人，因為它叫你去裝一個你明明已經裝好的東西。
+
+手動的解法，三選一：
+
+1. 改用 `python`（Windows 上就是這個名字，不是 `python3`）
+2. 用 Python Launcher：`py -3 spike\export_shards.py ...`
+3. 關掉轉址：設定 → 應用程式 → 進階應用程式設定 → 應用程式執行別名，
+   把 `python.exe` 與 `python3.exe` 關閉
+
+完整的 Windows 手動指令：
 
 ```bat
 python -m pip install torch transformers onnx onnxruntime onnxscript
@@ -91,58 +121,20 @@ python spike\export_shards.py --model HuggingFaceTB/SmolLM2-135M ^
 python spike\verify_shards.py --dir out\
 ```
 
-（`^` 是 cmd 的換行符號，相當於 Linux 的 `\`。用 PowerShell 的話改用 `` ` ``，
-或直接寫成一行。）
-
-後面的 `npm` 指令跨平台都一樣，不用改。
-`scripts/prepare-model.mjs` 會自己找 `python3` / `python` / `py -3`，
-不必手動設定。
+（`^` 是 cmd 的換行符號。PowerShell 用 `` ` ``，或直接寫成一行。）
 
 **順帶一提**：Python 3.14 沒問題 —— torch、onnxruntime、onnx 都有對應的
-Windows wheel。torch 的 Windows 版是 CPU build，只有約 124 MB，
-不需要加 `--index-url` 之類的參數。
+Windows wheel。torch 的 Windows 版是 CPU build，只有約 124 MB。
 
-### 二、建置
+---
 
-```bash
-cd web
-npm ci
-npm run build
-node scripts/prepare-model.mjs
-```
+## 另一種部署方式：接 GitHub 自動部署
 
-`prepare-model.mjs` 會把模型複製到 `dist/model/` 並自動切片。
-你應該會看到類似：
-
-```
-已複製 12 個檔案到 dist/model/（合計 214 MB）
-  其中 4 個超過 20 MiB，已切成片段：
-    shard_0.onnx.data  89 MB -> 5 片
-```
-
-確認沒有超標的檔案：
-
-```bash
-find dist -type f -size +25M      # 應該沒有任何輸出
-```
-
-### 三、部署
-
-**方法 A：命令列（最快）**
-
-```bash
-npx wrangler deploy
-```
-
-第一次會要你登入。部署完成後會印出網址。
-
-**方法 B：接 GitHub 自動部署**
-
-從你截圖的那個畫面開始：
+從 Cloudflare 主控台：
 
 1. **Workers & Pages** → **Create application**
-2. 選 **Import a repository**，授權並選 `arc119226/edge-cascade-llm`
-3. 建置設定填：
+2. 選 **Import a repository**，授權並選你的 repo
+3. 建置設定：
 
    | 欄位 | 值 |
    |---|---|
@@ -151,18 +143,18 @@ npx wrangler deploy
    | Deploy command | `npx wrangler deploy` |
    | Build output directory | `dist` |
 
-4. 儲存並部署
-
-> ⚠️ **方法 B 有個前提**：模型檔不在版控裡，所以 Cloudflare 的建置機器
-> 產不出 `dist/model/`。站台會上線但按下「開始量測」會失敗。
+> ⚠️ **這條路有個前提**：模型檔不在版控裡，Cloudflare 的建置機器**產不出**
+> `dist/model/`（它沒有 Python 環境，也不會為了一次建置去下載 torch）。
+> 站台會上線，但按下「開始量測」會失敗。
 >
-> 要讓自動部署也能用，得先把模型放到一個公開網址
-> （例如 GitHub Release 或任何可以 CORS 讀取的靜態空間），
-> 再在量測頁的「模型位置」欄位填那個網址。
+> 要讓自動部署也能用，得先把模型放到一個公開、可 CORS 讀取的網址
+> （例如 GitHub Release），再在量測頁的「模型位置」欄位填那個網址。
 >
-> **第一次先用方法 A**，模型跟程式一起傳上去，最單純。
+> **第一次建議先用 `npm run deploy`**，模型跟程式一起傳上去，最單純。
 
-### 四、確認
+---
+
+## 部署完成後的確認
 
 打開 `https://你的站.workers.dev/bench.html`，按「開始檢查」。
 
@@ -214,7 +206,7 @@ manifest.json  reference.json  reference.bin  native.bin  chunks.json
 shard_N.onnx   shard_N.onnx.data（或它的 .partN 片段）
 ```
 
-產生方式同步驟一。**上傳前務必先跑 `verify_shards.py`** ——
+產生方式見上面「想自己控制匯出參數」。**上傳前務必先跑 `verify_shards.py`** ——
 切分錯誤在瀏覽器裡很難查，輸出會看起來合理、只是慢慢偏掉。
 
 ---
@@ -243,13 +235,18 @@ shard_N.onnx   shard_N.onnx.data（或它的 .partN 片段）
 **手機跑到一半沒反應**
 多半是記憶體不足被瀏覽器清掉。把模型切更多段（每段更小）再試。
 
-**`找不到可用的 Python`**
-`prepare-model.mjs` 試過 `python3`、`python`、`py -3` 都沒找到。
-Windows 上常見原因是安裝 Python 時沒勾「Add python.exe to PATH」。
-重跑安裝程式選 Modify 補勾，或直接用 `py -3` 確認 Python Launcher 在不在。
+**`Python was not found; run without arguments to install from the Microsoft Store`**
+你打到 Windows 的 App Execution Alias 轉址 stub 了，不是真的 Python。
+最簡單的解法是**不要手動打 Python 指令**，改用 `npm run setup` 與 `npm run deploy` ——
+它們會自己找到正確的 Python。要手動跑的話見上面「陷阱二」。
 
-> 注意 Windows 內建一個叫 `python.exe` 的 Microsoft Store 轉址 stub，
-> 執行它會打開市集而不是跑 Python。偵測時已經會過濾掉這種情況。
+**`找不到可用的 Python`**
+腳本試過 `python3`、`python`、`py -3` 都沒找到真的 Python。
+Windows 上常見原因是安裝時沒勾「Add python.exe to PATH」——
+重跑安裝程式選 Modify 補勾，或確認 `py -3 --version` 跑得起來。
+
+> 若腳本偵測到的是轉址 stub，它會另外給一段專門的說明，
+> 而不是這則通用訊息。
 
 ---
 

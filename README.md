@@ -164,10 +164,11 @@ flowchart TB
 
 ## 自己跑跑看
 
-> **Windows 使用者**：把下面的 `python3` 換成 `python`。
-> 如果 `pip` 被 Smart App Control 擋下（訊息寫 "Device Guard"），
-> 改用 `python -m pip install ...` 即可，**不需要關掉任何安全設定** ——
-> 詳見[部署指南的 Windows 一節](docs/DEPLOY.md#windows-使用者請看這裡)。
+> **Windows 使用者**：下面 `cd web` 之後的 npm 指令跨平台都一樣，
+> 會自己找到你機器上的 Python，你不用打任何 Python 指令。
+> 前面那幾行研究用的指令請把 `python3` 換成 `python`。
+> 遇到「Device Guard 封鎖」或「Python was not found」的訊息，
+> 詳見[部署指南的 Windows 一節](docs/DEPLOY.md)。
 
 ```bash
 # 估算效能（不用下載模型，純數學）
@@ -179,13 +180,13 @@ python3 spike/export_shards.py --model HuggingFaceTB/SmolLM2-135M \
         --shards 4 --dtype int4 --out out/ --seed 42
 python3 spike/verify_shards.py --dir out/
 
-# 在瀏覽器裡跑
-cd web && npm ci && npm run build && node scripts/prepare-model.mjs
-npm test        # 用 headless 瀏覽器驗證整條流水線
-npm run dev     # 開 http://localhost:8080 自己玩
-
-# 部署到 Cloudflare（不需要付款方式，見 docs/DEPLOY.md）
-npx wrangler deploy
+# 在瀏覽器裡跑 / 部署到 Cloudflare
+cd web
+npm ci
+npm run setup    # 裝 Python 套件（會自己找到你的 Python）
+npm run dev      # 開 http://localhost:8080 自己玩
+npm test         # 用 headless 瀏覽器驗證整條流水線
+npm run deploy   # 建置 + 產生模型 + 部署（不需要付款方式）
 ```
 
 ---

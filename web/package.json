@@ -5,10 +5,12 @@
   "type": "module",
   "description": "EdgeCascadeLLM 瀏覽器節點與裝置效能量測工具",
   "scripts": {
+    "setup": "node scripts/setup-python.mjs",
     "build": "node scripts/build.mjs",
-    "dev": "node scripts/build.mjs && npx http-server dist -p 8080 -c-1 --cors",
-    "test": "npm run build -- --self-host-wasm && node scripts/prepare-model.mjs && node --test test/*.test.mjs",
-    "prepare-model": "node scripts/prepare-model.mjs"
+    "prepare-model": "node scripts/prepare-model.mjs",
+    "deploy": "npm run build && npm run prepare-model && wrangler deploy",
+    "dev": "npm run build && npm run prepare-model && npx http-server dist -p 8080 -c-1 --cors",
+    "test": "npm run build -- --self-host-wasm && npm run prepare-model && node --test test/*.test.mjs"
   },
   "dependencies": {
     "onnxruntime-web": "^1.30.0",
