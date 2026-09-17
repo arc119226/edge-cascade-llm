@@ -21,8 +21,9 @@ EdgeCascadeLLM 把一個大型語言模型垂直切分到多個瀏覽器節點�
 |---|---|
 | M0 數值模型 | ✅ 完成 |
 | **M1 層切分數值等價性（go/no-go 閘門）** | ✅ **通過** |
-| M2 瀏覽器 WebGPU | ⬜ 下一步 |
-| M3–M7 | ⬜ 未開始 |
+| **M4 激活值量化**（提前做，P0 風險） | ✅ **完成** |
+| M2 瀏覽器 WebGPU | ⬜ 進行中 |
+| M3 / M5–M7 | ⬜ 未開始 |
 
 完整路線見 [docs/02-roadmap.md](docs/02-roadmap.md)。
 
@@ -134,6 +135,25 @@ python3 spike/verify_shards.py --dir out/
 
 誤差**與切分數完全無關** —— 殘差全部來自 ONNX 對算子本身的匯出，
 切分這個動作是無損的。PyTorch 層級的串接誤差是 0.000e+00。
+
+### M4 spike：激活值量化
+
+```bash
+python3 spike/quant_sweep.py --outliers     # 離群通道統計
+python3 spike/quant_sweep.py --sweep all    # 完整方案掃描 + hop 累積表
+```
+
+線路格式已由實測敲定為 **`per-channel + 前 3% 通道 fp16`**（8.24 bits/值）：
+
+| 方案 | 線路位元 | PPL 退化 | argmax 一致 |
+|---|---|---|---|
+| per-tensor | 8.0 | **+30444%** | 4.30% |
+| per-channel | 8.0 | +6.23% | 85.01% |
+| group-64 | 8.0 | +0.48% | 97.56% |
+| **per-ch + outlier 3%** | **8.2** | **+0.03%** | **99.32%** |
+
+離群比值在 135M 就達 **1212×**（文獻對 6–7B 報告 20–100×）。
+完整數據：[docs/data/quant-results.md](docs/data/quant-results.md)。
 
 ---
 
