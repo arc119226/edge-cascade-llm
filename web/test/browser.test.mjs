@@ -139,6 +139,30 @@ test('瀏覽器中的 shard 流水線與未切分模型數值等價（WASM EP）
       };
     });
 
+    // 回歸測試：bench.html 走的是 compareProviders() 這條路徑。
+    // 它曾經因為直接 fetch('reference.json') —— 那份 JSON 改成只放中繼資料之後
+    // 就沒有 logits 欄位了 —— 而炸成 `undefined is not iterable`，
+    // 兩個 execution provider 都失敗。現有測試只驗 Pipeline + compareToReference，
+    // 沒有涵蓋量測頁真正在跑的組裝方式，所以那個錯一路漏到使用者手上。
+    const epCompare = await page.evaluate(async () => {
+      const ort = await import('./ort/ort.webgpu.mjs');
+      const { loadReference } = await import('./src/runner.js');
+      const { compareProviders } = await import('./src/bench.js');
+
+      const manifest = await (await fetch('./model/manifest.json')).json();
+      const reference = await loadReference('./model/', { preferNative: true });
+      const results = await compareProviders(ort, manifest, './model/', reference, ['wasm']);
+      return results[0];
+    });
+
+    console.log(`  compareProviders(wasm) ok=${epCompare.ok}` +
+      (epCompare.ok ? ` argmax ${epCompare.argmaxAgree}/${epCompare.argmaxTotal}` : ''));
+    assert.equal(
+      epCompare.ok, true,
+      `量測頁的後端比對失敗：${epCompare.error}\n` +
+      '（reference.json 只有中繼資料，必須用 loadReference() 載入二進位 logits）',
+    );
+
     console.log(`  模型切成 ${result.shards} 段（共 ${result.layers} 層），權重 ${result.dtype}`);
     console.log(`  對照組 ${result.referenceSource}`);
     console.log(`  wasm 來源 ${result.wasmPaths}`);
@@ -195,4 +219,48 @@ test('量化方案的 JS 實作與線路格式定義一致', async (t) => {
     if (Math.abs(x[i]) > 0.1) maxRel = Math.max(maxRel, Math.abs(q[i] - x[i]) / Math.abs(x[i]));
   }
   assert.ok(maxRel < 0.25, `量化誤差過大：最大相對誤差 ${(maxRel * 100).toFixed(1)}%`);
+});
+
+test('K* 與每段固定成本的分析：會誠實回報被截斷與 dispatch 主導', async (t) => {
+  if (!existsSync(dist)) {
+    t.skip('尚未建置');
+    return;
+  }
+  const { analyseKStar, deriveHopOverhead } =
+    await import(path.join(dist, 'src', 'bench.js'));
+
+  // 造一組「總耗時 = 40 + 2k」的完美資料：每位置耗時一路遞減，
+  // 永遠不會打平 —— 正是實測踩到的情況（K* 撞到掃描上限）。
+  const ks = [1, 2, 4, 8, 16, 32];
+  const points = ks.map((k) => ({
+    k,
+    totalMs: 40 + 2 * k,
+    msPerPosition: (40 + 2 * k) / k,
+    // 4 段，每段固定成本 10 ms、每位置 0.5 ms
+    shardMs: [0, 1, 2, 3].map(() => 10 + 0.5 * k),
+  }));
+
+  const k = analyseKStar(points);
+  assert.equal(k.kStar, 32, 'K* 應該是最後一個掃描點');
+  assert.equal(k.censored, true, '每位置耗時一路在降，必須標示為被截斷');
+  assert.ok(Math.abs(k.fit.fixedMs - 40) < 1e-6, `固定成本擬合錯誤：${k.fit.fixedMs}`);
+  assert.ok(Math.abs(k.fit.msPerPositionSlope - 2) < 1e-6);
+  assert.ok(Math.abs(k.fit.r2 - 1) < 1e-9, '完美直線的 r² 應該是 1');
+  // k=1 時總耗時 42，固定成本 40 -> 95%，遠超過一半
+  assert.equal(k.regime, 'dispatch-bound');
+
+  const manifest = { shards: [0, 1, 2, 3].map((i) => ({ index: i, layers: [i * 2, i * 2 + 1] })) };
+  const h = deriveHopOverhead(points, manifest);
+  assert.equal(h.method, 'per-shard-intercept');
+  assert.equal(h.perShard.length, 4);
+  assert.ok(Math.abs(h.fixedMsPerShard - 10) < 1e-6, `每段固定成本錯誤：${h.fixedMsPerShard}`);
+  assert.ok(Math.abs(h.sumShardFixedMs - 40) < 1e-6);
+  // 這組合成資料裡 4 段的截距剛好加總成整條流水線的截距，所以 JS 那一層是 0
+  assert.ok(Math.abs(h.glueMs) < 1e-6, `glueMs 應該接近 0，得到 ${h.glueMs}`);
+
+  // 對照組：真的有轉折點時不能誤報成被截斷
+  const flat = [1, 2, 4, 8].map((kk) => ({
+    k: kk, totalMs: 10 * kk, msPerPosition: 10, shardMs: [10 * kk],
+  }));
+  assert.equal(analyseKStar(flat).censored, false, '打平的曲線不該被當成還在降');
 });
