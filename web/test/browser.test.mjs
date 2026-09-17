@@ -156,12 +156,17 @@ test('瀏覽器中的 shard 流水線與未切分模型數值等價（WASM EP）
     });
 
     console.log(`  compareProviders(wasm) ok=${epCompare.ok}` +
-      (epCompare.ok ? ` argmax ${epCompare.argmaxAgree}/${epCompare.argmaxTotal}` : ''));
+      (epCompare.ok ? ` argmax ${epCompare.argmaxAgree}/${epCompare.argmaxTotal}` +
+        ` 首次 ${Math.round(epCompare.firstRunMs)}ms 穩態 ${Math.round(epCompare.ms)}ms` : ''));
     assert.equal(
       epCompare.ok, true,
       `量測頁的後端比對失敗：${epCompare.error}\n` +
       '（reference.json 只有中繼資料，必須用 loadReference() 載入二進位 logits）',
     );
+    // 冷熱必須分開回報：混在一起會讓人以為 WebGPU 比 WASM 慢（實際是 shader 編譯）
+    for (const field of ['firstRunMs', 'ms', 'warmupMs']) {
+      assert.equal(typeof epCompare[field], 'number', `缺少 ${field}`);
+    }
 
     console.log(`  模型切成 ${result.shards} 段（共 ${result.layers} 層），權重 ${result.dtype}`);
     console.log(`  對照組 ${result.referenceSource}`);
@@ -221,7 +226,7 @@ test('量化方案的 JS 實作與線路格式定義一致', async (t) => {
   assert.ok(maxRel < 0.25, `量化誤差過大：最大相對誤差 ${(maxRel * 100).toFixed(1)}%`);
 });
 
-test('K* 與每段固定成本的分析：會誠實回報被截斷與 dispatch 主導', async (t) => {
+test('掃描分析：直線資料要說「沒有轉折點」，不是「掃描不夠遠」', async (t) => {
   if (!existsSync(dist)) {
     t.skip('尚未建置');
     return;
@@ -242,12 +247,29 @@ test('K* 與每段固定成本的分析：會誠實回報被截斷與 dispatch �
 
   const k = analyseKStar(points);
   assert.equal(k.kStar, 32, 'K* 應該是最後一個掃描點');
-  assert.equal(k.censored, true, '每位置耗時一路在降，必須標示為被截斷');
+  assert.equal(k.censored, true, '每位置耗時一路在降，最低點必然落在邊界');
+  // 這一項才是重點：直線代表「範圍內沒有轉折點」，而不是「掃描不夠遠」。
+  // 把上限從 32 拉到 1024 也不會有轉折點，所以 UI 不該叫人拉高上限。
+  assert.equal(k.knee, 'none-observed', '完美直線必須標成沒有轉折點');
   assert.ok(Math.abs(k.fit.fixedMs - 40) < 1e-6, `固定成本擬合錯誤：${k.fit.fixedMs}`);
   assert.ok(Math.abs(k.fit.msPerPositionSlope - 2) < 1e-6);
   assert.ok(Math.abs(k.fit.r2 - 1) < 1e-9, '完美直線的 r² 應該是 1');
   // k=1 時總耗時 42，固定成本 40 -> 95%，遠超過一半
   assert.equal(k.regime, 'dispatch-bound');
+
+  // 投機解碼真正在意的兩個數字
+  assert.ok(Math.abs(k.firstPositionMs - 42) < 1e-6, '第一個位置應該是 40 + 2');
+  assert.ok(Math.abs(k.marginalMsPerPosition - 2) < 1e-6, '邊際成本應該等於斜率');
+
+  // 攤提：fixed/k + slope <= (1+pct)*slope  ->  k >= fixed / (pct*slope)
+  //   25% -> 40 / (0.25*2) = 80 ；10% -> 40 / (0.10*2) = 200
+  assert.deepEqual(k.amortisation, [{ withinPct: 25, k: 80 }, { withinPct: 10, k: 200 }]);
+
+  // 驗證視窗：γ=8 總耗時 56 ms，單一 token 42 ms -> 1.333 倍卻驗完 8 個位置
+  const g8 = k.verifyWindow.find((v) => v.gamma === 8);
+  assert.ok(Math.abs(g8.totalMs - 56) < 1e-6);
+  assert.ok(Math.abs(g8.vsSingleToken - 56 / 42) < 1e-9);
+  assert.deepEqual(k.verifyWindow.map((v) => v.gamma), [1, 4, 8, 16]);
 
   const manifest = { shards: [0, 1, 2, 3].map((i) => ({ index: i, layers: [i * 2, i * 2 + 1] })) };
   const h = deriveHopOverhead(points, manifest);
@@ -258,9 +280,19 @@ test('K* 與每段固定成本的分析：會誠實回報被截斷與 dispatch �
   // 這組合成資料裡 4 段的截距剛好加總成整條流水線的截距，所以 JS 那一層是 0
   assert.ok(Math.abs(h.glueMs) < 1e-6, `glueMs 應該接近 0，得到 ${h.glueMs}`);
 
-  // 對照組：真的有轉折點時不能誤報成被截斷
+  // 對照組一：打平的曲線不該被當成還在降
   const flat = [1, 2, 4, 8].map((kk) => ({
     k: kk, totalMs: 10 * kk, msPerPosition: 10, shardMs: [10 * kk],
   }));
   assert.equal(analyseKStar(flat).censored, false, '打平的曲線不該被當成還在降');
+
+  // 對照組二：真的有轉折點時必須認得出來，不能和直線混為一談。
+  // 每位置耗時先降後升，最低點在 K=4。
+  const kneed = [[1, 10], [2, 6], [4, 4], [8, 5], [16, 8]].map(([kk, per]) => ({
+    k: kk, totalMs: kk * per, msPerPosition: per, shardMs: [kk * per],
+  }));
+  const kneeResult = analyseKStar(kneed);
+  assert.equal(kneeResult.kStar, 4, '轉折點應該在 K=4');
+  assert.equal(kneeResult.censored, false);
+  assert.equal(kneeResult.knee, 'observed', '真的有轉折點時要標成 observed');
 });

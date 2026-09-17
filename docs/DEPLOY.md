@@ -208,6 +208,38 @@ npm run build -- --cross-origin-isolated
 
 ---
 
+## 筆電有兩張顯示卡，但只偵測到內顯
+
+**這不是網頁的問題，網頁也修不了。** Chrome 一次只用得到一張顯示卡 ——
+它用的是 GPU process 啟動時分配到的那張，筆電上通常是省電的內顯。
+
+依 [Chrome 官方 WebGPU troubleshooting 文件](https://developer.chrome.com/docs/web-platform/webgpu/troubleshooting-tips)，
+Windows 上 `requestAdapter()` 的 `powerPreference` 參數
+「doesn't have any impact」，而且 Chrome
+「does not support using multiple GPU adapters simultaneously」。
+量測頁會對兩種偏好各要一次 adapter，拿到同一張就會直接告訴你這件事。
+
+要換成獨立顯卡，得在瀏覽器或作業系統層級設定，三選一：
+
+1. **Chrome flag**（最快）
+   網址列輸入 `chrome://flags/#force-high-performance-gpu` → 設成 **Enabled**
+   → 重啟 Chrome。
+2. **Windows 每應用程式偏好**
+   設定 → 系統 → 顯示 → 顯示卡 → 瀏覽並加入 `chrome.exe`
+   （通常在 `C:\Program Files\Google\Chrome\Application\`）
+   → 選項 → **高效能** → 儲存 → 重啟 Chrome。
+3. **NVIDIA 控制面板**
+   管理 3D 設定 → 程式設定 → 選 `chrome.exe`
+   → 慣用的圖形處理器選「高效能 NVIDIA 處理器」。
+
+改完之後用 `chrome://gpu` 確認：最上面的 GPU 清單會列出偵測到的顯示卡，
+其中一張標著 active。量測頁的報告裡也會有 `ort.actualAdapter` 欄位 ——
+那是由 ORT 建立的 device 直接回報的，可以用來確認設定真的生效了。
+
+> 獨立顯卡比較耗電。筆電沒插電的時候，續航會明顯變短。
+
+---
+
 ## 換一個模型
 
 量測頁上的「模型位置」欄位可以填任何提供這些檔案的網址：
@@ -219,6 +251,30 @@ shard_N.onnx   shard_N.onnx.data（或它的 .partN 片段）
 
 產生方式見上面「想自己控制匯出參數」。**上傳前務必先跑 `verify_shards.py`** ——
 切分錯誤在瀏覽器裡很難查，輸出會看起來合理、只是慢慢偏掉。
+
+### 用環境變數換模型（最簡單的方式）
+
+`npm run prepare-model` 吃兩個環境變數，不用手動跑 Python：
+
+```bash
+MODEL=HuggingFaceTB/SmolLM2-360M SHARDS=6 npm run dev
+```
+
+### 想真正回答「一次多算幾個位置划不划算」
+
+預設的 SmolLM2-135M **太小，回答不了這一題**。實測顯示它有 79% 的時間
+花在固定的呼叫開銷上，總耗時對位置數是一條完美直線 —— 根本沒有轉折點
+（詳見 [可行性評估 §7.3](00-feasibility.md)）。
+
+要看到真正的行為需要 1B 以上的模型：
+
+```bash
+MODEL=HuggingFaceTB/SmolLM2-1.7B SHARDS=8 npm run dev
+```
+
+**只在本機跑，不要部署它** —— 那是約 1.7 GB 的下載量，
+不該壓在每個幫忙測試的人身上。線上的量測頁維持 135M 是刻意的取捨。
+第一次匯出會花不少時間，而且需要約 10 GB 的磁碟空間。
 
 ---
 

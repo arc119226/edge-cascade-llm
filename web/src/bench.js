@@ -9,9 +9,11 @@
  *     但 Petals 是 Python + CUDA，瀏覽器 + WebGPU 完全是另一回事。
  *     這個值決定 P（節點數）的上限，是整個架構最敏感的參數之一。
  *
- * Q2  平行視窗 K* 有多大？
- *     理論值：K* = 讀權重時間 / 每位置 FLOPs 時間。手機推算約 5.5。
- *     若實測 K* < 3，投機解碼的效益空間就太小，整條路線要重新評估。
+ * Q2  一次算多個位置划不划算？
+ *     原本問的是「roofline 轉折點 K* 在哪」（理論推算手機約 5.5）。
+ *     但實測發現 135M 模型在真實裝置上根本沒有轉折點 —— 總耗時對 k
+ *     是一條直線（r²=0.9994），78.7% 的時間花在固定 dispatch 開銷上。
+ *     所以改問「多算一個位置的邊際成本是多少」，見 analyseKStar()。
  *
  * ⚠ 這兩題共用同一次掃描，而且刻意如此 —— 見 sweepSeqLen() 的說明。
  *   舊版用「把 4 段收成 2 段」的方式製造不同 hop 數來量 Q1，那是錯的：
@@ -122,23 +124,32 @@ export async function sweepSeqLen(pipeline, manifest, {
   return points;
 }
 
+/** 投機解碼實際會用到的猜測長度。超過這個範圍 draft 模型也猜不準。 */
+const VERIFY_WINDOWS = [1, 4, 8, 16];
+
 /**
- * Q2 — 從掃描結果找出平行視窗 K*。
+ * Q2 — 一次算多個位置到底划不划算。
  *
- * 原理：batch=1 解碼是記憶體頻寬受限的，所以一次算 K 個位置時，
- * 權重只讀一次、FLOPs 變 K 倍。K 小的時候時間幾乎不變（「免費」），
- * 超過 K* 之後轉為計算受限，時間開始隨 K 線性成長。
- * K* = 每位置耗時最低的那個 K。
+ * 原本的問法是「roofline 轉折點 K* 在哪」：batch=1 解碼是記憶體頻寬受限的，
+ * 一次算 K 個位置時權重只讀一次、FLOPs 變 K 倍，所以 K 小的時候幾乎「免費」，
+ * 超過 K* 之後轉為計算受限。K* = 每位置耗時最低的那個 K。
  *
- * 但這個定義有兩個陷阱，實測資料都踩到了，所以這裡一併回報：
+ * **實測發現這個問法在小模型上得不到答案。** 第一台真實裝置的資料是
+ * `總耗時 = 27.95 + 4.23 × k`，r² = 0.9994 —— 一條完美直線。
+ * 那代表 `每位置耗時 = 27.95/k + 4.23` 對所有 k 單調遞減，永遠沒有最小值，
+ * 所以「K* = 掃描上限」不管上限拉到 64 還是 1024 都會成立。
+ * 不是掃描不夠遠，是 135M 太小、78.7% 的時間花在 dispatch 上，
+ * 記憶體頻寬根本不是瓶頸，roofline 的前提不成立。
  *
- * `censored` — K* 落在掃描的最大值上，代表每位置耗時到掃描上限**都還在降**，
- *   那是搜尋被截斷，不是 roofline 轉折點。把它當轉折點報出去是錯的。
+ * 所以這裡改報**投機解碼真正在意的東西**：
  *
- * `regime`  — 若 totalMs 的擬合截距（與 k 無關的固定成本）在 k=1 時就佔了
- *   大半時間，那瓶頸是 session.run 的 dispatch 開銷，不是權重讀取頻寬。
- *   這種情況下量到的 K* 反映的是「呼叫成本被攤掉的速度」，
- *   跟 roofline 的 K* 是兩回事，不能外推到更大的模型。
+ *   `marginalMsPerPosition` 多算一個位置的邊際成本（= 擬合斜率）
+ *   `firstPositionMs`       第一個位置的成本（含整條流水線的固定開銷）
+ *   `verifyWindow`          猜 γ 個字一次驗證，要花單一 token 的幾倍時間
+ *   `knee`                  範圍內到底有沒有轉折點，而不是含糊的 censored
+ *
+ * γ=8 花 60.6 ms、是單一 token 35.5 ms 的 1.71 倍卻產出 8 個位置 ——
+ * 這個數字直接回答「投機解碼划不划算」，而一個假的 K* 不會。
  */
 export function analyseKStar(points) {
   // 嚴格小於：打平的區間會保留較小的 K，所以 kStar 落在上限就真的是「還在降」。
@@ -147,14 +158,56 @@ export function analyseKStar(points) {
 
   const k1 = points.find((p) => p.k === 1);
   const maxKTested = points[points.length - 1].k;
+  const censored = best.k === maxKTested;
   const fit = linearFit(points.map((p) => p.k), points.map((p) => p.totalMs));
   const fixedFractionAtK1 = fit && k1 ? fit.intercept / k1.totalMs : null;
 
+  // censored 只說「最低點落在邊界」，沒說為什麼。這裡把兩種原因分開：
+  //   observed      範圍內有真正的轉折點（最低點在內部）
+  //   none-observed 資料是一條直線 —— 沒有轉折點可找，拉高上限也沒用
+  //   unknown       擬合太差，說不準
+  let knee;
+  if (!censored) knee = 'observed';
+  else if (fit && fit.r2 >= 0.99) knee = 'none-observed';
+  else knee = 'unknown';
+
+  // 要讓每位置耗時逼近漸近線到某個百分比，需要多大的 K。
+  // 由 fixed/k + slope <= (1 + pct) * slope 解出 k >= fixed / (pct * slope)。
+  const amortisation = [];
+  if (fit && fit.slope > 0 && fit.intercept > 0) {
+    for (const withinPct of [25, 10]) {
+      amortisation.push({
+        withinPct,
+        k: Math.ceil(fit.intercept / ((withinPct / 100) * fit.slope)),
+      });
+    }
+  }
+
+  const verifyWindow = VERIFY_WINDOWS
+    .map((gamma) => {
+      const pt = points.find((p) => p.k === gamma);
+      if (!pt || !k1) return null;
+      return {
+        gamma,
+        totalMs: pt.totalMs,
+        msPerPosition: pt.msPerPosition,
+        vsSingleToken: pt.totalMs / k1.totalMs,
+      };
+    })
+    .filter(Boolean);
+
   return {
     points,
+    // 以下兩個是新的主角
+    firstPositionMs: k1?.totalMs ?? null,
+    marginalMsPerPosition: fit?.slope ?? null,
+    verifyWindow,
+    amortisation,
+    knee,
+    // kStar 保留是為了和舊報告對得上，但 knee !== 'observed' 時它沒有意義
     kStar: best.k,
     maxKTested,
-    censored: best.k === maxKTested,
+    censored,
     msPerPositionAtK1: k1?.msPerPosition ?? null,
     msPerPositionAtKStar: best.msPerPosition,
     speedupAtKStar: k1 ? k1.msPerPosition / best.msPerPosition : null,
@@ -228,7 +281,7 @@ export function deriveHopOverhead(points, manifest) {
  * 如果 WebGPU 與 WASM 算出的 logits 差太多，混用不同 EP 的節點
  * 就會讓流水線產生分歧 —— 那會是很難查的錯：輸出看起來合理、只是慢慢偏掉。
  */
-export async function compareProviders(ort, manifest, baseUrl, reference, eps) {
+export async function compareProviders(ort, manifest, baseUrl, reference, eps, { repeats = 3 } = {}) {
   const results = [];
   let firstLogits = null;
 
@@ -240,10 +293,27 @@ export async function compareProviders(ort, manifest, baseUrl, reference, eps) {
       const ids = BigInt64Array.from(reference.input_ids.flat().map(BigInt));
       const seq = reference.input_ids[0].length;
 
+      // 第一次執行和之後的完全不是同一件事：WebGPU 要編譯 shader、
+      // 兩邊都要做 kernel 特化與記憶體配置。實測 WebGPU 首次 269 ms，
+      // 暖機後同樣長度只要 93 ms —— 把兩者混在一起報，會讓人得出
+      // 「WebGPU 比 WASM 慢」這個錯誤結論。所以分開量、分開報。
+      //
+      // firstRunMs 本身也有用：那是一個節點加入網路後的暖機成本（M3 會在意）。
       const t0 = performance.now();
       const out = await pipe.run(ids, seq);
-      entry.ms = performance.now() - t0;
+      entry.firstRunMs = performance.now() - t0;
+
+      // 正確性比對用第一次的輸出，趁它還沒被後面的執行蓋掉
       Object.assign(entry, compareToReference(out.logits, out.dims, reference));
+
+      const times = [];
+      for (let r = 0; r < repeats; r++) {
+        const t = performance.now();
+        await pipe.run(ids, seq);
+        times.push(performance.now() - t);
+      }
+      entry.ms = median(times);
+      entry.warmupMs = entry.firstRunMs - entry.ms;
 
       // 也和第一個成功的 EP 互比 —— 那才是「不同節點會不會分歧」的直接答案
       if (firstLogits === null) {
@@ -271,8 +341,10 @@ export async function compareProviders(ort, manifest, baseUrl, reference, eps) {
 export function buildReport(parts) {
   return {
     // v2：hopOverhead 改用逐 shard 截距法（v1 的子集合流水線量測是混淆的），
-    // kStar 多了 censored / regime / fit 欄位。
-    schemaVersion: 2,
+    //     kStar 多了 censored / regime / fit 欄位。
+    // v3：kStar 改以邊際成本與驗證視窗為主（censored 本身回答不了問題），
+    //     providerComparison 分開冷啟動與穩態。
+    schemaVersion: 3,
     generatedAt: new Date().toISOString(),
     ...parts,
   };
