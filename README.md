@@ -164,6 +164,11 @@ flowchart TB
 
 ## 自己跑跑看
 
+> **Windows 使用者**：把下面的 `python3` 換成 `python`。
+> 如果 `pip` 被 Smart App Control 擋下（訊息寫 "Device Guard"），
+> 改用 `python -m pip install ...` 即可，**不需要關掉任何安全設定** ——
+> 詳見[部署指南的 Windows 一節](docs/DEPLOY.md#windows-使用者請看這裡)。
+
 ```bash
 # 估算效能（不用下載模型，純數學）
 python3 bench/model.py --model 32b --nodes 4
