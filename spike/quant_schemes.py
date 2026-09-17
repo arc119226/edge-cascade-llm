@@ -5,9 +5,28 @@
 每個方案都是 quantize -> dequantize 的往返（我們不是要存 int8，
 而是要模擬「傳輸時壓成 int8，收到後解回浮點」造成的資訊損失）。
 
-重要：這裡的實作將來要和 `web/quant.js` 一對一對應。
-JS 端若算出不同的結果，流水線就會在節點之間產生不一致。
-所以每個函式都刻意寫得直白、避免依賴 PyTorch 特有的廣播細節。
+這裡和 `web/src/quant.js` 是**同一組方案的兩份實作**，但**不是逐位元相同**，
+不要寫任何 assert 兩邊相等的測試 —— 那個測試一定會紅，而且紅的原因不在測試裡。
+（`quant.js` 的檔頭原本就寫著「必須逐位元對應」，那句話是假的，已經改掉。）
+
+三個確定對不上的地方：
+
+1. **捨入方向**：`torch.round` 是 half-to-even，JS 的 `Math.round` 是 half-up。
+   `torch.round([2.5, -2.5, 3.5, 0.5])` = `[2, -2, 4, 0]`，
+   同樣的輸入 JS 給的是 `[3, -2, 4, 1]`。這條吃到每一個被量化的值。
+2. **fp16 往返**：這裡用 `.to(torch.float16)`（IEEE round-to-nearest-even，
+   保留非正規數）；`quant.js` 的 `fp16Roundtrip()` 是手寫的位元操作，
+   捨入是 half-up、非正規數直接沖成 ±0。
+3. **離群比例的預設值**：這裡 `outlier_frac=0.01`，`quant.js` 是 `0.03`。
+   連挑出來的離群 channel 集合都不一樣，所以 frame header 必須明確帶
+   `outlierCount`（`docs/01-architecture.md` §4.5.2），不能靠約定反推。
+
+兩邊該成立的是**統計上等價**（同方案、同語料下 PPL 與 argmax 一致率導向同一個結論），
+不是位元相等。位元相等那個要求屬於 `web/src/wire.js` 的 encode/decode 往返。
+
+另外：這個檔案和 `quant.js` 一樣都**不產生位元組** —— 每個函式回傳的是
+quantize->dequantize 之後的張量。真正的線路序列化在 `web/src/wire.js`，
+真實位元組帳在 `bench/wire_size.py`。
 
 背景：hidden state 有「離群通道」—— 少數幾個 channel 的數值可達中位數的
 20–100 倍，且在 6–7B 以上的模型必然出現（LLM.int8(), arXiv 2208.07339）。

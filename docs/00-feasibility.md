@@ -211,9 +211,33 @@ $$K^* = \frac{\text{權重位元組} / \text{記憶體頻寬}}{2 \times \text{�
 | 5 | 每 hop 固定開銷隨 P 累積 | Petals 約 36 ms/hop；P≥4 時 70B 達不到 6 tok/s | 壓低 P；批次化 GPU dispatch；避免不必要的序列化 |
 | 6 | 冷啟動權重下載 | 32B/P=4 = 4 GB/節點，30Mbps 需 **18 分鐘** | 節點長駐 + OPFS 持久快取 |
 | 7 | 節點流失 (churn) | 每節點每分鐘掉線率 5% 時，P=8 有 **34% 對話會中斷** | 熱備冗餘 R=2（有效算力砍半）+ activation checkpoint 續傳 |
-| 8 | NAT 穿透失敗需 TURN | 直連失敗率通常有兩位數百分比 | **「完全去中心化」的宣稱要收回**；TURN fallback 是必需的中心化元件 |
+| 8 | NAT 穿透失敗需 TURN | **22%**（callstats.io 全球流量統計）／ **17.7%**（appear.in）的連線需要 TURN 中繼 | **「完全去中心化」的宣稱要收回**；TURN fallback 是必需的中心化元件。但 v1 的同 LAN 場景失敗主因不是 NAT，見下方註 |
 | 9 | WebRTC DataChannel 訊息上限 | 單則訊息 256 KiB | 應用層分片 + `bufferedAmount` 背壓 |
 | 10 | 瀏覽器背景分頁節流 | 背景分頁被重度節流 | 節點必須前景；對「志願算力」模式是硬傷 |
+
+> **第 8 項有兩處要修正，一處是出處，一處是場景。**
+>
+> **一、原本寫的是「直連失敗率通常有兩位數百分比」，沒有出處。**
+> 現在有了：callstats.io 對自家全球流量的統計是**約 22%** 的連線需要 TURN 中繼，
+> appear.in 公布的數字是 **17.7%**。兩個都落在原本那句「兩位數」裡，
+> 所以**結論沒有變** —— 但「大概是兩位數吧」和「22% / 17.7%，出處在此」
+> 在要估算 TURN 頻寬成本時是兩回事，只有後者算得出錢。
+> 沒出處的數字會一路被引用到對外文件裡，那時就來不及了。
+>
+> **二、更要緊的是：那兩個數字量的是公網，而 v1 的場景是同一個區域網路。**
+> 同網段根本不需要穿透 NAT，所以在單一 LAN 上直連失敗時，**主因不是 NAT**，
+> 而是這兩件文獻不會提、但實際上真的會把你擋在門外的事：
+>
+> - **mDNS / 多播被過濾掉。** 瀏覽器為了不洩漏本機 IP，host candidate 送的是
+>   `.local` 的 mDNS 名稱。企業與校園 Wi-Fi、AP 的 client isolation、
+>   訪客網路經常直接濾掉多播 —— 名稱解不開，那個候選位址就等於不存在。
+> - **作業系統的「本機網路」權限。** macOS 與 iOS 會對「存取區域網路上的裝置」
+>   跳權限提示；沒按允許（或提示壓根沒跳出來）就找不到對方。
+>
+> 這兩種失敗的**長相和 NAT 穿透失敗一模一樣**（就是連不上），
+> 但解法完全不同 —— 加 TURN 一點忙都幫不上。
+> 所以 M3 的同 LAN 手動驗收必須能分辨這兩類失敗，見
+> [02-roadmap.md](02-roadmap.md) 的 M3 一節。
 
 ### 🟡 P2 — 重要但可延後
 
@@ -234,8 +258,26 @@ $$K^* = \frac{\text{權重位元組} / \text{記憶體頻寬}}{2 \times \text{�
 | 單機速度 | 快 | 慢約 3× |
 | 層範圍切分 | ❌ 需改 TVM 編譯流程 | ✅ 從 PyTorch 直接 export `ModuleList[a:b]` |
 | hidden-state 當作 I/O | ❌ 只有 `generate(tokens)` | ✅ 是普通 graph input/output |
-| KV cache 外部管理 | ❌ 封裝在 runtime 內 | ✅ GQA 運算元把 `past_key/value` 暴露成 tensor |
+| KV cache 外部管理 | ❌ 封裝在 runtime 內 | ✅ `past_key/value` 就是普通的 graph input/output（機制見下方註）|
 | int4 量化 | ✅ | ✅ `MatMulNBits`（ORT 1.17+） |
+
+> ⚠️ **「KV cache 外部管理」這一格原本寫的是「ORT 的 GQA 運算元把
+> `past_key/value` 暴露成 tensor」。結論對，機制錯，而且錯的方向會害到下一個人。**
+>
+> `spike/export_shards.py:169` 匯出時用的是 `attn_implementation="eager"`，
+> 也就是**不**走任何融合實作 —— attention 被完全拆成 MatMul / Softmax / Trilu
+> 之類的基本算子。匯出的圖裡**沒有** `Attention` 節點，
+> 更沒有 `GroupQueryAttention`。所以 KV cache 不會以「某個融合算子的額外 I/O」
+> 的形式出現，而是以**普通的 graph 輸入輸出 + `Concat`**
+> （把 past 的 K/V 接上這一步新算出來的）出現。
+>
+> 留著錯的機制不是無害的：下一個人去實作 KV cache 匯出時，會先去圖裡找 GQA 節點、
+> 去查 `GroupQueryAttention` 的 I/O 約定與 layout 規範，然後發現那些東西根本不存在，
+> 白繞一圈才回到「自己加輸入輸出」這條路。
+>
+> 而且真正的選型論點本來就不靠 GQA：ORT 贏在**圖是我們自己從 PyTorch 匯出的，
+> 要暴露什麼 I/O 由我們決定**。這一點不依賴任何特定融合算子存不存在，
+> 反而比原本的說法更強。
 
 **關鍵論證**：本專案的瓶頸是**網路延遲與每 hop 固定開銷**，不是單機計算。
 用 3× 慢但能切分的引擎，換掉一個可能做不出來的編譯器改造，是划算的交易。
@@ -563,9 +605,17 @@ Petals 證明了技術可行，但網路效應才是殺手。
 - [WebGPU: Troubleshooting tips and fixes ― Chrome for Developers](https://developer.chrome.com/docs/web-platform/webgpu/troubleshooting-tips)（§7.6 的 powerPreference 與多顯示卡限制）
 - [Chromium issue 40268366: WebGPU powerPreference option ignored](https://issues.chromium.org/issues/40268366)
 - [Petals: Collaborative Inference and Fine-tuning of Large Models](https://petals.dev/) ／ [GitHub](https://github.com/bigscience-workshop/petals)
+- callstats.io 的全球 WebRTC 連線統計：約 **22%** 的連線需要 TURN 中繼；
+  appear.in 公布的同類數字是 **17.7%**（§3 P1 第 8 項）。
+  ⚠ 兩者量的都是**公網**流量；本專案 v1 的同 LAN 場景不適用，理由見該項的註。
+- Eskola & Nurminen, *Performance of WebRTC in Mobile Networks*（2014，
+  量測對象是 Chromium 38 / Firefox 33）—— 「SCTP 把吞吐壓在數十 Mbps」這個說法的源頭。
+  ⚠ 其機制（128 KiB 接收視窗）早已不成立，見
+  [03-open-questions.md Q5](03-open-questions.md)。
 
 > ⚠️ **尚未一手查證、撰寫時需補**：vanilla Jacobi / Lookahead / EAGLE 的
 > **確切**加速倍數與接受長度（本文用的是保守估計值）；WebRTC DataChannel
-> 在住宅網路間的實測吞吐上限；NAT 穿透失敗率的具體統計；各家瀏覽器
+> 在住宅網路間的實測吞吐上限（Q5 已重新界定問題，但仍未實測）；各家瀏覽器
 > WebGPU 可用顯存與 storage quota 的確切數字。
+> NAT 穿透失敗率**已補上出處**（見上方 callstats.io / appear.in 一條）。
 > §2.3 的結論對這些數字不敏感（見敏感度分析），但對外發布前每個數字都要有出處。

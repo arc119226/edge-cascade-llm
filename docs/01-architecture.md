@@ -263,7 +263,7 @@ head-of-line blocking —— RFC 8260 的 ndata 在 Chrome 是關閉的、在 Fi
 分片在 frame **底下**，所以 frame 層完全不必知道 DataChannel 的存在，
 可以用假的 channel 單元測試。
 
-#### 4.5.2 Frame header（固定 32 位元組，little-endian）
+#### 4.5.2 Frame header（固定 40 位元組，little-endian）
 
 端序一律 little-endian，明確寫死，不依賴平台。
 
@@ -275,21 +275,32 @@ head-of-line blocking —— RFC 8260 的 ndata 在 Chrome 是關閉的、在 Fi
 | 6 | 1 | `schemeId` | 0=none 1=per-channel 2=group-64 3=per-ch+outlier |
 | 7 | 1 | `flags` | bit0：scale 用 fp16（0=fp32）。其餘保留為 0 |
 | 8 | 4 | `roundId` | 這是第幾次 traversal |
-| 12 | 1 | `stageIndex` | 產生這則訊息的 shard 序號 |
-| 13 | 1 | — | 保留，0 |
-| 14 | 2 | `dModel` | |
-| 16 | 2 | `qLen` | 這則訊息裡有幾個 token 位置（即 K）|
-| 18 | 4 | `startPosition` | 第一個 token 的**絕對**位置 |
-| 22 | 2 | `scaleCount` | scale 區塊有幾個值 |
-| 24 | 2 | `outlierCount` | 離群索引區塊有幾個值 |
-| 26 | 4 | `payloadLen` | header 之後的位元組數 |
-| 30 | 2 | — | 保留，0（湊滿 32，維持 4 位元組對齊）|
+| 12 | 4 | `dModel` | 一列的寬度 |
+| 16 | 4 | `qLen` | 這則訊息裡有幾個 token 位置（即 K）|
+| 20 | 4 | `startPosition` | 第一個 token 的**絕對**位置 |
+| 24 | 4 | `scaleCount` | scale 區塊有幾個值 |
+| 28 | 4 | `outlierCount` | 離群索引區塊有幾個值 |
+| 32 | 4 | `payloadLen` | header 之後的位元組數 |
+| 36 | 2 | `stageIndex` | 產生這則訊息的 shard 序號 |
+| 38 | 2 | — | 保留，0（湊滿 40，維持 4 位元組對齊）|
 
 `scaleCount` 與 `outlierCount` **必須明確帶在 header 裡**，不能讓接收端從
 `dModel` 與某個約定的 `outlierFrac` 反推。理由：離群比例是呼叫端參數
 （`quant.js` 是 0.03、Python 版是 0.01），而且兩個方案的 scale 數量規則不同
 （per-channel 是 `d`、group-64 是 `K × ceil(d/64)`）。少了這兩個欄位，
 接收端找不到 payload 的邊界。
+
+> **為什麼這些計數是 u32 而不是 u16。** 第一版寫成 u16，對抗性審查用一行輸入
+> 就打穿了：§4.5.7 的回程要送完整 logits，而 logits 的「一列寬度」是
+> `vocab_size`。SmolLM2-135M 的 49152 剛好塞得進 u16，所以本機測不出問題 ——
+> 但 Llama 3 是 128256、Qwen 2.5 是 151936、Gemma 是 256000，全部塞不下。
+> 換句話說，u16 版的 frame **無法表達 §4.5.7 自己規定的訊息**。
+>
+> `scaleCount` 同理：group-64 的 scale 數是 `K × ceil(d/64)`，
+> d=8192、K=512 時就是 65536，剛好溢位。
+>
+> header 多 8 個位元組，換掉一個之後只能靠升版本才能修的協定缺陷。
+> 現在改是免費的，之後改不是。
 
 #### 4.5.3 `startPosition` / `qLen`：M3 用不到，但現在就要有
 
@@ -311,8 +322,21 @@ KV cache 或投機解碼一落地，各節點就會靜默地對不上。所以�
 
 #### 4.5.4 Payload 佈局
 
-區塊順序刻意讓**所有 ≥2 位元組的區塊排在前面、1 位元組的 int8 本體排最後**，
-這樣 `Uint16Array` / `Float32Array` 視圖都能直接建在對齊位置上，不用複製。
+區塊順序刻意讓**所有 ≥2 位元組的區塊排在前面、1 位元組的 int8 本體排最後**。
+
+> **原本這裡寫的理由是錯的。** 初版說這樣排是為了讓 `Uint16Array` /
+> `Float32Array` 視圖能直接建在對齊位置上。實作時發現不成立：方案 3 配 fp32
+> scale 時，scale 區塊落在位移 `40 + nOut × 2`，而 `nOut` 是奇數
+> （d=576 時 17、d=5120 時 153），所以位移是 4 的餘數 2 —— 建 `Float32Array`
+> 視圖會直接丟例外。
+>
+> 正確的理由有兩個，而且都成立：(1) 把唯一一個 1 位元組粒度的區塊放在最後，
+> 其餘區塊的長度就都是偶數，不需要在中間插入對齊填充；(2) int8 本體是唯一
+> 真的能零複製建視圖的區塊（1 位元組對齊永遠滿足）。
+>
+> 其餘欄位一律走 `DataView` 並明確指定 `littleEndian = true` ——
+> 那本來就比 typed-array 視圖更該用，因為 typed-array 視圖跟著平台端序走，
+> 在 big-endian 機器上會靜默算錯。
 
 本體一律 token-major（t 外層、c 內層），對應 `x[t * dModel + c]`。
 
@@ -340,8 +364,49 @@ S 是 scale 的位元組數（flags bit0：fp16=2、fp32=4）。
 這條規則讓 `wire.js` 自洽。它與 `quant.js` 的關係則是：
 **`quant.js` 是 M4 的品質模擬器，不是線路格式的實作。**
 `quant.js` 的 `SCHEMES.fn` 回傳 `Float32Array`（量化→反量化的往返），
-從來沒有產生過任何位元組。兩者的綁定測試是「fp32 scale 時逐位元相等、
-fp16 scale 時相對誤差 < 2⁻¹⁰」，而不是無條件相等。
+從來沒有產生過任何位元組。
+
+兩者的綁定不能寫成「無條件逐位元相等」，有兩個實測出來的理由：
+
+1. **`groupWise` 的 scale 是裸的 JS double**（`quant.js:92`，`m / qmax`），
+   不是 `Float32Array` 元素。`m/127` 幾乎不可能剛好是一個 fp32 值，
+   所以 `quant.js` 用來量化的那個數字**永遠不可能出現在線路上**。
+   實測 d=576/K=8 時 4608 個值裡有 1275 個不同。
+   （`perChannel` 沒這個問題，它的 scale 存在 `Float32Array` 裡。）
+2. **fp16 scale 會讓一部分 int8 碼翻到隔壁。** 把 scale 捨入到 fp16 會移動它
+   最多 2⁻¹¹，而 `|x/scale|` 最大到 127，所以原本落在 .5 邊界附近的值會選到
+   相鄰的整數碼，兩邊的重建值就差一整個量化步階（約 2⁻⁷），不是 2⁻¹⁰。
+   實測 d=5120/K=32 per-channel 有 0.95% 的值會翻。
+   **這不是 bug，正是遵守本節規則的必然結果**，2⁻¹⁰ 那個界限講的是
+   *scale 本身*，不是重建值。
+
+所以綁定測試斷言的是三件可證明的事：
+每個線路上的 scale 與精確 scale 的相對誤差 < 2⁻¹⁰；
+逐元素的差異永遠不超過一個量化步階；翻碼的比例低於 5%。
+
+#### 4.5.5b 飽和規則：有限的輸入不准變成 Inf 或 NaN
+
+對抗性審查用一行輸入打穿了兩條靜默路徑，兩條都必須明確規定：
+
+1. **fp16 離群本體溢位。** 方案 3 的離群 channel 走 fp16，
+   `|x| ≥ 65520` 的有限 fp32 值會被編成 fp16 的 ±Inf。
+   諷刺的是這條路徑存在的理由（§4.2：巨值集中在少數 channel）
+   正好就是它會爆的場景 —— 而同一個值走 int8 路徑毫無問題。
+2. **fp16 scale 溢位。** channel（或 group-64 的一組）的 `max|x|`
+   達到 `127 × 65520 = 8,321,040` 時，scale 捨入成 Inf，
+   int8 碼全部變 0，解碼端算 `0 × Inf = NaN` ——
+   整個 channel 或整組 64 個 channel 變 NaN，兩端都不報錯。
+
+規則：
+
+- **fp16 編碼一律飽和到 ±65504**（fp16 的最大有限值），不產生 Inf。
+- **scale 一律飽和到 65504**，所以最大可表示值是 `127 × 65504 = 8,319,008`；
+  超過的部分 int8 碼夾在 ±127，會損失數值大小，但保持有限。
+- **輸入本身若含 Inf 或 NaN，`encode()` 直接丟錯。** 那是呼叫端的 bug，
+  不該由線路格式偷偷吞掉。代價是零：算 `max|x|` 本來就要掃一遍。
+
+第三條特別重要，因為 NaN 沿著 hop 傳播正是這個專案最難查的失敗模式 ——
+輸出看起來合理、只是慢慢偏掉。寧可在來源丟錯。
 
 #### 4.5.6 Chunk 子標頭（8 位元組，little-endian）
 
