@@ -7,11 +7,12 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "dev": "node scripts/build.mjs && npx http-server dist -p 8080 -c-1 --cors",
-    "test": "node --test test/*.test.mjs",
+    "test": "npm run build -- --self-host-wasm && node scripts/prepare-model.mjs && node --test test/*.test.mjs",
     "prepare-model": "node scripts/prepare-model.mjs"
   },
   "dependencies": {
-    "onnxruntime-web": "^1.30.0"
+    "onnxruntime-web": "^1.30.0",
+    "wrangler": "^4.133.0"
   },
   "devDependencies": {
     "playwright": "^1.56.0"

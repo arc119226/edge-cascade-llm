@@ -24,15 +24,79 @@ async function openCache() {
 }
 
 /**
- * 抓一個 shard 檔案，優先走快取。
+ * 分塊索引。建置時由 scripts/prepare-model.mjs 產生。
+ *
+ * Cloudflare 的單檔上限是 25 MiB，而 ONNX 的 external data 旁檔動輒上百 MB，
+ * 所以大檔會被切成 `<name>.partN`。這裡快取索引，避免每個檔都重抓一次。
+ */
+const chunkIndexCache = new Map();
+
+async function loadChunkIndex(baseUrl) {
+  if (chunkIndexCache.has(baseUrl)) return chunkIndexCache.get(baseUrl);
+  let index = {};
+  try {
+    const res = await fetch(baseUrl + 'chunks.json');
+    if (res.ok) index = await res.json();
+  } catch {
+    // 沒有索引就當作沒有檔案被切過（本機直接放完整檔的情況）
+  }
+  chunkIndexCache.set(baseUrl, index);
+  return index;
+}
+
+/**
+ * 抓一個 shard 檔案，優先走快取；檔案若被切過就自動重組。
  *
  * @param {string} url
- * @param {{optional?: boolean, onProgress?: Function}} opts
+ * @param {{optional?: boolean, onProgress?: Function, baseUrl?: string}} opts
  *        optional=true 時，404 會回傳 null 而不是拋錯
  *        （用於 .onnx.data 旁檔 —— 小模型沒有這個檔是正常的）
  * @returns {Promise<Uint8Array|null>}
  */
 export async function fetchShard(url, opts = {}) {
+  // 先看這個檔有沒有被切成片段
+  const slash = url.lastIndexOf('/');
+  const baseUrl = opts.baseUrl ?? url.slice(0, slash + 1);
+  const name = url.slice(slash + 1);
+  const index = await loadChunkIndex(baseUrl);
+  const info = index[name];
+  if (info) return fetchChunked(baseUrl, name, info, opts);
+
+  return fetchOne(url, opts);
+}
+
+/**
+ * 抓一個被切成片段的檔案並重組。
+ *
+ * 片段各自快取，所以中途重新整理不用把已下載的部分重抓一次 ——
+ * 對一個要下載數百 MB 的節點來說，這個差別很大。
+ */
+async function fetchChunked(baseUrl, name, info, opts) {
+  const out = new Uint8Array(info.size);
+  let offset = 0;
+
+  for (let i = 0; i < info.parts; i++) {
+    const partUrl = `${baseUrl}${name}.part${i}`;
+    const part = await fetchOne(partUrl, {});
+    if (!part) throw new Error(`缺少片段 ${partUrl}`);
+    out.set(part, offset);
+    offset += part.length;
+    opts.onProgress?.({ url: baseUrl + name, part: i + 1, parts: info.parts });
+  }
+
+  if (offset !== info.size) {
+    // 大小對不上代表某個片段不完整，繼續用下去只會在 ONNX 解析時爆出
+    // 難以理解的錯誤，不如在這裡就講清楚。
+    throw new Error(
+      `${name} 重組後大小不符：得到 ${offset}，期望 ${info.size}。` +
+      `可能是某個片段上傳不完整。`,
+    );
+  }
+  return out;
+}
+
+/** 單一檔案的抓取（快取優先）。分塊與非分塊共用。 */
+async function fetchOne(url, opts) {
   const cache = await openCache();
 
   if (cache) {
@@ -48,8 +112,6 @@ export async function fetchShard(url, opts = {}) {
     if (opts.optional && res.status === 404) return null;
     throw new Error(`抓取 ${url} 失敗：HTTP ${res.status}`);
   }
-
-  // 先放進快取再讀 body：cache.put 會消耗掉 response，所以要 clone
   if (cache) {
     try {
       await cache.put(url, res.clone());
@@ -57,7 +119,6 @@ export async function fetchShard(url, opts = {}) {
       /* 配額滿了就算了，不影響這次執行 */
     }
   }
-
   opts.onProgress?.({ url, cached: false });
   return new Uint8Array(await res.arrayBuffer());
 }

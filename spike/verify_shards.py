@@ -31,8 +31,10 @@ import onnxruntime as ort
 def main() -> None:
     ap = argparse.ArgumentParser(description="驗證 ONNX shard 串接的數值等價性")
     ap.add_argument("--dir", default="out", help="export_shards.py 的輸出目錄")
-    ap.add_argument("--tolerance", type=float, default=1e-3,
-                    help="logits 的 max abs diff 容忍上限")
+    ap.add_argument("--tolerance", type=float, default=None,
+                    help="logits 的 max abs diff 容忍上限。"
+                         "預設依 manifest 的 dtype 自動選：fp32/fp16 用 1e-3，"
+                         "int4 用 2.0（量化本來就會改變數值，這裡看的是 argmax）。")
     args = ap.parse_args()
 
     d = Path(args.dir)
@@ -41,10 +43,24 @@ def main() -> None:
 
     input_ids = np.array(ref_data["input_ids"], dtype=np.int64)
     position_ids = np.array(ref_data["position_ids"], dtype=np.int64)
-    ref_logits = np.array(ref_data["logits"], dtype=np.float32).reshape(
-        ref_data["logits_shape"])
+    # logits 存在旁邊的二進位檔（fp16）。舊格式把它塞在 JSON 裡，
+    # 那會是 14.7 MB 的文字且超過 Cloudflare 單檔上限，已經改掉。
+    if "logits_file" in ref_data:
+        raw = (d / ref_data["logits_file"]).read_bytes()
+        ref_logits = np.frombuffer(raw, dtype=np.float16).astype(np.float32).reshape(
+            ref_data["logits_shape"])
+    else:
+        ref_logits = np.array(ref_data["logits"], dtype=np.float32).reshape(
+            ref_data["logits_shape"])
+
+    dtype = manifest.get("dtype", "fp32")
+    # 量化過的模型不可能逐值等價 —— 硬套 1e-3 只會得到一個必然失敗的測試。
+    # 對 int4 而言真正的驗收條件是 argmax 一致（貪婪解碼選同樣的字）。
+    tolerance = args.tolerance if args.tolerance is not None else (
+        2.0 if dtype == "int4" else 1e-3)
 
     print(f"模型      {manifest['model']}")
+    print(f"權重精度  {dtype}（每參數 {manifest.get('bytes_per_param', 4)} bytes）")
     print(f"切分      {manifest['num_layers']} 層 -> {manifest['num_shards']} 個 shard "
           f"{manifest['bounds']}")
     print(f"d_model   {manifest['hidden_size']}")
@@ -95,7 +111,7 @@ def main() -> None:
     tok_match = int((got_tok == ref_tok).sum())
     tok_total = int(got_tok.size)
 
-    print(f"logits max abs diff   {max_diff:.3e}   (容忍上限 {args.tolerance:.0e})")
+    print(f"logits max abs diff   {max_diff:.3e}   (容忍上限 {tolerance:.0e})")
     print(f"logits mean abs diff  {mean_diff:.3e}")
     print(f"argmax token 一致     {tok_match}/{tok_total}")
 
@@ -107,13 +123,43 @@ def main() -> None:
         print(f"換算每 token 每 hop   {per_tok:.0f} B (fp32) / "
               f"{per_tok / 4:.0f} B (int8) — 可拿去校正 bench/model.py")
 
+    # 把 native ORT 的輸出存下來，給瀏覽器端測試當對照組。
+    #
+    # 這一步是必要的，因為「量化模型 vs fp32 真值」和「瀏覽器 vs 原生」
+    # 是兩個完全不同的問題，混在一起就沒有一個數字說得清楚：
+    #   - 量化模型本來就不該等於 fp32，差異多少是「量化品質」
+    #   - 瀏覽器跑同一份 ONNX，就該等於原生跑，差異多少是「流水線正確性」
+    # 拿 fp32 當瀏覽器測試的對照組，會把量化誤差誤判成流水線 bug。
+    native = got.astype(np.float16)
+    (d / "native.bin").write_bytes(native.tobytes())
+    ref_data["native_file"] = "native.bin"
+    ref_data["native_argmax"] = got.argmax(-1).ravel().tolist()
+    (d / "reference.json").write_text(json.dumps(ref_data))
+    print(f"\n已寫出 native.bin（原生 ORT 的輸出，供瀏覽器端測試比對）")
+
     print("=" * 62)
-    ok = max_diff < args.tolerance and tok_match == tok_total
-    if ok:
-        print("\n✓ M1 通過：ONNX shard 串接與未切分模型數值等價。")
-        print("  EdgeCascadeLLM 的核心前提成立，可以往 M2（瀏覽器 + WebGPU）推進。")
+    quantised = dtype not in ("fp32",)
+    if quantised:
+        # 量化模型不可能等於 fp32，硬要求等價只會得到一個必然失敗的測試。
+        # 這裡的驗收條件是「還是個像樣的模型」，不是「逐值相同」。
+        ok = tok_match >= tok_total * 0.8
     else:
-        print("\n✗ M1 未通過。")
+        ok = max_diff < tolerance and tok_match == tok_total
+    if ok and not quantised:
+        print("\n✓ 通過：ONNX shard 串接與未切分模型數值等價。")
+        print("  殘差全部來自 ONNX 算子匯出，與切分數無關（M1 已用固定輸入證實）。")
+    elif ok:
+        print(f"\n✓ 通過：{dtype} 量化後仍與 fp32 真值一致 {tok_match}/{tok_total}。")
+        print("  logits 的絕對差異來自**權重量化**，不是切分 ——")
+        print("  切分本身無損這件事 M1 已經用 fp32 單獨驗過了。")
+    elif quantised:
+        print(f"\n✗ {dtype} 量化把模型弄壞了：argmax 只剩 {tok_match}/{tok_total}。")
+        print("  這不是切分的問題（fp32 下已驗證切分無損），是量化太激進。")
+        print("  對策：提高 --quant-bits（4 -> 8）或縮小 --quant-block。")
+        print("  已知：SmolLM2-135M 在 4-bit 下只有 3/16，8-bit 有 15/16 ——")
+        print("        小模型對低位元量化特別敏感。")
+    else:
+        print("\n✗ 未通過。")
         if tok_match != tok_total:
             print("  argmax 不一致代表這不只是精度問題，是切分邏輯有錯。")
             print("  優先檢查：RoPE 的 position_ids 是否在每個 shard 都正確、")

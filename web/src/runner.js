@@ -194,9 +194,51 @@ export function argmaxPerPosition(logits, dims) {
   return out;
 }
 
+/**
+ * 載入參考 logits。
+ *
+ * 有兩組對照值，用途完全不同，不可混用：
+ *   - reference.bin  未量化的 PyTorch fp32 真值 -> 用來衡量「量化品質」
+ *   - native.bin     原生 ORT 跑同一份 ONNX 的輸出 -> 用來驗證「瀏覽器流水線正確性」
+ *
+ * 驗證瀏覽器時必須拿 native.bin 比。拿 fp32 真值比的話，量化誤差會被
+ * 誤判成流水線的 bug —— 那是兩個不同的問題，混在一起就沒有一個數字說得清楚。
+ *
+ * 都存成 fp16 二進位而非 JSON：786,432 個浮點數存 JSON 是 14.7 MB，
+ * 存 fp16 只要 1.5 MB，而且 JSON 版本本身就超過 Cloudflare 的單檔上限。
+ */
+export async function loadReference(baseUrl, { preferNative = true } = {}) {
+  const base = baseUrl.endsWith('/') ? baseUrl : baseUrl + '/';
+  const meta = await (await fetch(base + 'reference.json')).json();
+
+  const file = preferNative && meta.native_file ? meta.native_file : meta.logits_file;
+  if (!file) {
+    // 舊格式把 logits 直接放在 JSON 裡
+    return { ...meta, logits: Float32Array.from(meta.logits), source: 'legacy-json' };
+  }
+  const buf = await (await fetch(base + file)).arrayBuffer();
+  const half = new Uint16Array(buf);
+  const logits = new Float32Array(half.length);
+  for (let i = 0; i < half.length; i++) logits[i] = fp16ToFloat(half[i]);
+
+  return { ...meta, logits, source: file };
+}
+
+/** fp16 位元樣式轉 JS number。 */
+function fp16ToFloat(h) {
+  const sign = (h & 0x8000) ? -1 : 1;
+  const exp = (h >> 10) & 0x1f;
+  const frac = h & 0x3ff;
+  if (exp === 0) return sign * Math.pow(2, -14) * (frac / 1024);
+  if (exp === 0x1f) return frac ? NaN : sign * Infinity;
+  return sign * Math.pow(2, exp - 15) * (1 + frac / 1024);
+}
+
 /** 與參考 logits 比對，回傳可讀的差異報告。 */
 export function compareToReference(logits, dims, reference) {
-  const expected = Float32Array.from(reference.logits);
+  const expected = reference.logits instanceof Float32Array
+    ? reference.logits
+    : Float32Array.from(reference.logits);
   let maxAbsDiff = 0;
   for (let i = 0; i < expected.length; i++) {
     const d = Math.abs(logits[i] - expected[i]);
