@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EdgeCascadeLLM — 把大模型拆到多台裝置上一起跑</title>
+<meta name="description" content="用瀏覽器把一個大型語言模型拆成好幾段，讓多台裝置接力運算，跑出單機塞不下的模型。">
+<link rel="icon" href="./icon-192.png" type="image/png">
+<link rel="manifest" href="./manifest.webmanifest">
+<meta name="theme-color" content="#0b1020">
+<style>
+  :root {
+    --bg: #0b1020; --panel: #151b30; --line: #263050;
+    --fg: #e8ecf8; --dim: #97a2c4; --accent: #6ea8ff;
+    --ok: #4ade80; --warn: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 16px 80px;
+    background: var(--bg); color: var(--fg);
+    font: 17px/1.8 system-ui, -apple-system, "Noto Sans TC", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 32px; line-height: 1.3; margin: 0 0 8px; }
+  h2 { font-size: 21px; margin: 44px 0 10px; }
+  .lede { font-size: 19px; color: var(--dim); margin: 0 0 8px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 18px; margin: 16px 0;
+  }
+  .btn {
+    display: inline-block; background: var(--accent); color: #05122e;
+    border-radius: 8px; padding: 12px 22px; font-weight: 600;
+    text-decoration: none; margin-top: 8px;
+  }
+  .btn.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  a { color: var(--accent); }
+  .dim { color: var(--dim); }
+  .small { font-size: 15px; }
+  figure { margin: 20px 0; }
+  figcaption { color: var(--dim); font-size: 14px; margin-top: 8px; text-align: center; }
+  svg { width: 100%; height: auto; display: block; }
+  ul { padding-left: 20px; }
+  li { margin: 6px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; margin-top: 8px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; }
+  .tag { font-size: 13px; padding: 2px 8px; border-radius: 99px; background: #1e2a4a; color: var(--dim); }
+  .tag.ok { background: #14331f; color: var(--ok); }
+</style>
+</head>
+<body>
+<main>
+  <h1>把一個太大的 AI 模型<br>拆到好幾台裝置上一起跑</h1>
+  <p class="lede">
+    最強的開源語言模型需要 35 GB 記憶體。你的筆電沒有，手機更沒有。
+    但如果三五台裝置各出一點，湊起來就夠了。
+  </p>
+  <p class="dim small">EdgeCascadeLLM 是一個實驗性專案，目前還在驗證階段。</p>
+
+  <h2>問題是什麼</h2>
+  <p>
+    大型語言模型是由很多層堆起來的，資料從第一層流到最後一層才產生答案。
+    層越多、模型越聰明，但也越佔記憶體。一個 700 億參數的模型壓縮過後
+    還是要 <strong>35 GB</strong> —— 那超過絕大多數消費級裝置的上限。
+  </p>
+  <p>
+    傳統作法是「買一台更大的機器」或「付錢用雲端」。
+    這個專案試的是第三條路：<strong>把模型切開，一台裝置只負責其中幾層。</strong>
+  </p>
+
+  <h2>怎麼運作</h2>
+  <figure>
+    <svg viewBox="0 0 720 210" role="img" aria-label="模型被切成四段，分別放在四台裝置上依序運算">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="#6ea8ff"/>
+        </marker>
+      </defs>
+      <text x="8" y="22" fill="#97a2c4" font-size="13">你的問題</text>
+      <rect x="4" y="30" width="96" height="52" rx="8" fill="#1e2a4a" stroke="#263050"/>
+      <text x="52" y="61" fill="#e8ecf8" font-size="14" text-anchor="middle">提問</text>
+
+      <line x1="104" y1="56" x2="140" y2="56" stroke="#6ea8ff" stroke-width="2" marker-end="url(#ar)"/>
+
+      <rect x="146" y="30" width="122" height="52" rx="8" fill="#151b30" stroke="#6ea8ff"/>
+      <text x="207" y="52" fill="#e8ecf8" font-size="14" text-anchor="middle">裝置 A</text>
+      <text x="207" y="70" fill="#97a2c4" font-size="12" text-anchor="middle">第 1–8 層</text>
+
+      <line x1="272" y1="56" x2="308" y2="56" stroke="#6ea8ff" stroke-width="2" marker-end="url(#ar)"/>
+
+      <rect x="314" y="30" width="122" height="52" rx="8" fill="#151b30" stroke="#6ea8ff"/>
+      <text x="375" y="52" fill="#e8ecf8" font-size="14" text-anchor="middle">裝置 B</text>
+      <text x="375" y="70" fill="#97a2c4" font-size="12" text-anchor="middle">第 9–16 層</text>
+
+      <line x1="440" y1="56" x2="476" y2="56" stroke="#6ea8ff" stroke-width="2" marker-end="url(#ar)"/>
+
+      <rect x="482" y="30" width="122" height="52" rx="8" fill="#151b30" stroke="#6ea8ff"/>
+      <text x="543" y="52" fill="#e8ecf8" font-size="14" text-anchor="middle">裝置 C</text>
+      <text x="543" y="70" fill="#97a2c4" font-size="12" text-anchor="middle">第 17–30 層</text>
+
+      <line x1="608" y1="56" x2="644" y2="56" stroke="#6ea8ff" stroke-width="2" marker-end="url(#ar)"/>
+      <rect x="650" y="30" width="66" height="52" rx="8" fill="#14331f" stroke="#4ade80"/>
+      <text x="683" y="61" fill="#4ade80" font-size="14" text-anchor="middle">答案</text>
+
+      <text x="207" y="112" fill="#97a2c4" font-size="12" text-anchor="middle">↓ 每段之間傳的是</text>
+      <text x="375" y="112" fill="#97a2c4" font-size="12" text-anchor="middle">「算到一半的中間結果」</text>
+      <text x="543" y="112" fill="#97a2c4" font-size="12" text-anchor="middle">而不是整個模型</text>
+
+      <rect x="146" y="128" width="458" height="40" rx="8" fill="#0d1428" stroke="#263050" stroke-dasharray="4 3"/>
+      <text x="375" y="153" fill="#97a2c4" font-size="13" text-anchor="middle">
+        每次交接只要傳幾十 KB —— 比傳整個模型小上百萬倍
+      </text>
+    </svg>
+    <figcaption>模型被切成幾段，每台裝置只放其中一段。資料像接力一樣依序流過。</figcaption>
+  </figure>
+
+  <p>
+    關鍵在於：<strong>裝置之間傳的不是模型本身，而是「算到一半的中間結果」</strong>。
+    那只有幾十 KB，用一般網路就傳得動。模型權重只要下載一次就快取起來，之後都不用再傳。
+  </p>
+
+  <h2>老實說的限制</h2>
+  <div class="card small">
+    <ul style="margin:0">
+      <li><strong>比單機慢。</strong>如果你的裝置本來就塞得下模型，自己跑一定比較快。
+        這個專案是為了跑「本來完全跑不動」的模型。</li>
+      <li><strong>沒有隱私保護。</strong>中間結果有可能被反推出你問了什麼。
+        目前只適合用在<strong>你信任的裝置之間</strong>。</li>
+      <li><strong>第一次很慢。</strong>每台裝置要先下載自己負責的那幾層，可能要十幾分鐘。
+        之後有快取就快了。</li>
+      <li><strong>還在驗證階段。</strong>目前完成了「切開之後結果還對不對」的驗證，
+        但完整的多裝置連線還沒做完。</li>
+    </ul>
+  </div>
+
+  <h2>你可以幫的忙</h2>
+  <p>
+    我們需要知道各種真實裝置跑起來是什麼樣子 —— 手機、筆電、不同的顯示卡。
+    開發環境裡沒有 GPU，這些數字量不到。
+  </p>
+  <div class="card">
+    <strong>跑一次裝置量測</strong>
+    <p class="small dim" style="margin:6px 0 0">
+      全程在你的瀏覽器裡執行，不會上傳任何東西。跑完會給你一段文字，貼回來給我們就好。
+      大約需要幾分鐘。
+    </p>
+    <a class="btn" href="./bench.html">開始量測</a>
+  </div>
+
+  <h2>目前進度</h2>
+  <table>
+    <tr><th>階段</th><th>狀態</th></tr>
+    <tr><td>效能數學模型</td><td><span class="tag ok">完成</span></td></tr>
+    <tr><td>切開之後結果還對嗎</td><td><span class="tag ok">完成</span></td></tr>
+    <tr><td>壓縮中間結果會不會失真</td><td><span class="tag ok">完成</span></td></tr>
+    <tr><td>在瀏覽器裡跑起來</td><td><span class="tag ok">完成</span></td></tr>
+    <tr><td>多台裝置真的連起來</td><td><span class="tag">還沒做</span></td></tr>
+    <tr><td>加速：一次多猜幾個字</td><td><span class="tag">還沒做</span></td></tr>
+  </table>
+
+  <p style="margin-top:32px">
+    <a class="btn ghost" href="https://github.com/arc119226/edge-cascade-llm">看原始碼與技術文件</a>
+  </p>
+</main>
+<script>
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+</script>
+</body>
+</html>

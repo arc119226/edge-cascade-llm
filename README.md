@@ -1,170 +1,195 @@
-# edge-cascade-llm
+# EdgeCascadeLLM
 
-> 基於 WebRTC 與投機解碼的 P2P 分散式 LLM 推理引擎
-> —— 讓消費級裝置跑得動它本來完全跑不動的模型
+> 把一個太大的 AI 模型拆到好幾台裝置上一起跑。
 
-EdgeCascadeLLM 把一個大型語言模型垂直切分到多個瀏覽器節點上，
-用 WebGPU 執行、用 WebRTC DataChannel 在節點之間傳遞中間狀態張量。
-目標是讓**沒有任何單一裝置塞得下的模型**（32B / 70B 級）
-能在三五台自有裝置組成的私有網路上跑起來。
+最強的開源語言模型需要 **35 GB** 記憶體。你的筆電沒有，手機更沒有。
+但如果三五台裝置各出一點，湊起來就夠了。
 
-**這是一個「容量」專案，不是「速度」專案。**
-單機跑得動的模型（8B 以下），切分它沒有意義。
+這個專案試的就是這件事：**把模型切成幾段，一台裝置只負責其中幾層，接力算完。**
 
 ---
 
-## 專案狀態
+## 這在解決什麼問題
 
-**早期。核心可行性閘門已通過，但尚未有可用的端到端系統。**
+大型語言模型是由很多「層」堆起來的。你的問題從第一層流到最後一層，才會產生答案。
+層越多，模型越聰明，但也越佔記憶體。
 
-| 里程碑 | 狀態 |
+一個 700 億參數的模型，壓縮過後還是要 35 GB。
+那超過幾乎所有消費級裝置的上限 —— 你只能買更貴的機器，或付錢用雲端。
+
+**這個專案提供第三條路**：既然一台裝置放不下整個模型，那就每台放一部分。
+
+```mermaid
+flowchart LR
+    Q["你的問題"] --> A
+    A["裝置 A<br/>第 1-8 層"] -->|中間結果<br/>約 30 KB| B
+    B["裝置 B<br/>第 9-16 層"] -->|中間結果<br/>約 30 KB| C
+    C["裝置 C<br/>第 17-30 層"] --> R["答案"]
+
+    style Q fill:#1e2a4a,stroke:#263050,color:#e8ecf8
+    style A fill:#151b30,stroke:#6ea8ff,color:#e8ecf8
+    style B fill:#151b30,stroke:#6ea8ff,color:#e8ecf8
+    style C fill:#151b30,stroke:#6ea8ff,color:#e8ecf8
+    style R fill:#14331f,stroke:#4ade80,color:#4ade80
+```
+
+**關鍵在於：裝置之間傳的不是模型本身，而是「算到一半的中間結果」。**
+
+那只有幾十 KB，一般網路就傳得動。
+模型權重只要下載一次就存在本機，之後都不用再傳。
+
+---
+
+## 實際的網路長什麼樣子
+
+```mermaid
+flowchart TB
+    subgraph net["你信任的裝置們（例如自己的機器 + 朋友的）"]
+        direction LR
+        H["主控裝置<br/>發問與組裝答案<br/>另外跑一個小模型來猜"]
+        N1["筆電<br/>第 1-20 層"]
+        N2["桌機<br/>第 21-40 層"]
+        N3["筆電<br/>第 41-60 層"]
+        N4["平板<br/>第 61-80 層"]
+    end
+
+    H -->|WebRTC 直連| N1
+    N1 --> N2
+    N2 --> N3
+    N3 --> N4
+    N4 -->|答案送回| H
+
+    S["配對服務<br/>只幫裝置互相找到對方<br/>不碰任何資料"] -.介紹彼此.-> H
+    S -.-> N1
+
+    style H fill:#1e2a4a,stroke:#6ea8ff,color:#e8ecf8
+    style N1 fill:#151b30,stroke:#263050,color:#e8ecf8
+    style N2 fill:#151b30,stroke:#263050,color:#e8ecf8
+    style N3 fill:#151b30,stroke:#263050,color:#e8ecf8
+    style N4 fill:#151b30,stroke:#263050,color:#e8ecf8
+    style S fill:#0d1428,stroke:#97a2c4,color:#97a2c4
+```
+
+裝置之間是**直接連線**的（WebRTC），資料不經過中央伺服器。
+配對服務只做一件事：幫兩台裝置互相找到對方，像交換電話號碼一樣。
+
+> ⚠️ 但**不是完全沒有伺服器**。有些網路環境下裝置無法直連，
+> 必須透過中繼站轉送。我們不會假裝這一點不存在。
+
+---
+
+## 為什麼需要「猜」
+
+把模型拆開有一個代價：**每產生一個字，資料都要跑完整條接力**。
+如果有 8 台裝置、每次交接要 50 毫秒，那產生一個字就要花將近半秒。太慢了。
+
+解法是讓主控裝置**先用一個小模型猜幾個字**，再把這幾個字**一次送進接力鏈驗證**：
+
+```mermaid
+flowchart TB
+    S1["1. 主控裝置用小模型快速猜 8 個字<br/>（在本機，不用連網）"]
+    S2["2. 把這 8 個字一次送進接力鏈<br/>（只跑一趟）"]
+    S3["3. 大模型檢查：猜對幾個？"]
+    S4a["前 5 個猜對<br/>直接採用"]
+    S4b["第 6 個猜錯<br/>用大模型的答案取代"]
+    S5["回到步驟 1，繼續猜下一批"]
+
+    S1 --> S2 --> S3
+    S3 --> S4a --> S5
+    S3 --> S4b --> S5
+
+    style S1 fill:#1e2a4a,stroke:#6ea8ff,color:#e8ecf8
+    style S2 fill:#151b30,stroke:#6ea8ff,color:#e8ecf8
+    style S3 fill:#151b30,stroke:#263050,color:#e8ecf8
+    style S4a fill:#14331f,stroke:#4ade80,color:#4ade80
+    style S4b fill:#331414,stroke:#f87171,color:#f87171
+    style S5 fill:#0d1428,stroke:#97a2c4,color:#97a2c4
+```
+
+**猜錯也沒關係** —— 猜錯的部分會被大模型的正確答案取代，
+所以最後品質和「一個字一個字慢慢算」是一樣的。猜對就賺到，一趟接力產出好幾個字。
+
+這個技巧叫**投機解碼**（speculative decoding），是既有的成熟技術，不是我們發明的。
+
+---
+
+## 老實說的限制
+
+| 限制 | 說明 |
 |---|---|
-| M0 數值模型 | ✅ 完成 |
-| **M1 層切分數值等價性（go/no-go 閘門）** | ✅ **通過** |
-| **M4 激活值量化**（提前做，P0 風險） | ✅ **完成** |
-| M2 瀏覽器 WebGPU | ⬜ 進行中 |
-| M3 / M5–M7 | ⬜ 未開始 |
+| **比單機慢** | 如果你的裝置本來就塞得下模型，自己跑一定比較快。這個專案是為了跑**本來完全跑不動**的模型。 |
+| **沒有隱私保護** | 中間結果有可能被反推出你問了什麼。目前只適合用在**你信任的裝置之間**。 |
+| **不是完全去中心化** | 有些網路環境需要中繼伺服器才連得起來。 |
+| **第一次很慢** | 每台裝置要先下載自己負責的那幾層，可能要十幾分鐘。之後有快取就快了。 |
+| **還在驗證階段** | 核心假設已經驗證過，但多裝置連線還沒做完。 |
 
-完整路線見 [docs/02-roadmap.md](docs/02-roadmap.md)。
-
----
-
-## 核心架構
-
-系統同時用到兩種平行，它們**作用在不同指標上**：
-
-```
-                     深度軸（層）                      位置軸（序列）
-                  ─────────────────                ─────────────────
-  平行方式        流水線平行                        投機解碼
-  依賴性質        嚴格資料依賴，不可打破             因果依賴，可猜測+驗證
-  解決什麼        單一裝置塞不下模型                 每 token 要走幾趟流水線
-  改善的指標      容量                              延遲
-```
-
-### 為什麼是投機解碼
-
-在 P2P 網路上，每走一趟完整流水線要付
-`P × (RTT/2 + 每 hop 固定開銷)` —— 動輒數百毫秒。
-所以關鍵不是「讓節點不要空轉」，而是**「一趟 traversal 多產出幾個 token」**。
-
-作法是：頭節點**在本機**用一個小 draft model 猜 γ 個 token（零網路延遲），
-然後用**一趟**流水線 traversal 一次驗證全部 γ+1 個位置。
-昂貴的 WAN 成本因此被攤掉。
-
-```
-[ 頭節點：draft model 本地猜 γ 個 token ]   ← 零網路延遲
-                  │
-                  ▼
-[ Stage 0：embed + 層 0–a ]
-                  │  hidden state over WebRTC
-                  ▼
-[ Stage 1：層 a–b ]
-                  │
-                  ▼
-[ Stage N-1：層 c– + norm + lm_head ]
-                  │  logits
-                  ▼
-[ 頭節點：驗證 → 接受 1..γ+1 個 token ]
-```
-
-### 等價性
-
-| 取樣模式 | 保證 |
-|---|---|
-| greedy | **逐 token 與標準自迴歸相同** |
-| temperature sampling | **分布等價**（rejection sampling 修正） |
-
-這是可測試的性質，不是設計意圖 —— 見 [路線圖 M5](docs/02-roadmap.md) 的驗收條件。
-
-詳細規格見 [docs/01-architecture.md](docs/01-architecture.md)。
+前輩專案 [Petals](https://petals.dev/) 已經證明這條路技術上可行，
+但它的公開網路現在幾乎沒人用了。
+**真正的難題不是技術，是找不找得到夠多人一起跑。**
+所以我們刻意從「自己的幾台裝置」這種小規模開始，而不是一開始就做公開網路。
 
 ---
 
-## 誠實的限制
+## 目前進度
 
-這個專案有幾個**不打算粉飾**的限制：
+| 階段 | 在問什麼 | 狀態 |
+|---|---|---|
+| M0 | 這樣做理論上跑多快？ | ✅ 完成 |
+| M1 | 把模型切開，結果還對嗎？ | ✅ **完成，結果完全正確** |
+| M4 | 壓縮中間結果會不會失真？ | ✅ 完成，找到可用的壓縮方式 |
+| M2 | 在瀏覽器裡跑得起來嗎？ | ✅ 完成（真實顯示卡的效能待實測） |
+| M3 | 多台裝置真的連起來 | ⬜ 下一步 |
+| M5 | 加上「猜字」加速 | ⬜ 還沒做 |
+| M6–M7 | 自動配對、斷線接手 | ⬜ 還沒做 |
 
-- **不是完全去中心化。** NAT 直連會失敗一定比例，必須有 TURN relay fallback，
-  那是一個中心化元件。
-- **沒有隱私保護。** 中間激活值可以反推出原始 prompt。
-  v1 僅適用於**互相信任的節點**，不要拿來跑敏感內容。
-- **沒有計算真實性驗證。** 浮點運算跨 GPU 的不確定性讓 bit-exact 驗證不可能，
-  金絲雀張量可被惡意節點特判偵測。v1 靠信任網路，不試圖解拜占庭問題。
-- **比單機慢。** 如果你的裝置塞得下模型，單機跑一定比這個快。
-- **冷啟動很慢。** 32B/P=4 每個節點要下載約 4 GB，一般家寬約 18 分鐘。
+**幾個已經驗證的結果：**
 
-前身專案 [Petals](https://petals.dev/) 證明了這條路技術上可行
-（70B 實測可達數 tok/s），但其公開 swarm 已進入 maintenance mode。
-**網路效應才是真正的殺手**，不是技術。
-因此 v1 範圍刻意收斂到「私有信任 swarm」。
+- 把模型切成 2、4、8、15 段，算出來的結果**完全一樣** —— 切分本身不會讓模型變笨
+- 中間結果可以壓到約 1/4 大小，品質只掉 **0.03%**
+- 但壓縮方法要選對：用錯的方法會讓模型直接壞掉（困惑度從 13.8 暴增到 4208）
 
 ---
 
-## 快速開始
+## 你可以幫的忙
 
-目前可跑的是數值模型與 M1 spike。
+我們需要知道各種真實裝置跑起來是什麼樣子 —— 手機、筆電、不同的顯示卡。
+開發環境裡沒有顯示卡，這些數字量不到。
 
-### 效能估算
+**開啟量測頁面，按兩個按鈕，把結果貼回來就好。**
+全程在你的瀏覽器裡執行，不會上傳任何東西。
+
+---
+
+## 自己跑跑看
 
 ```bash
-python3 bench/model.py --model 32b --nodes 4 --rtt 50 --mbps 20
-python3 bench/model.py --sweep k          # 掃描平行視窗，含敏感度分析
-python3 bench/model.py --roofline         # 各裝置的免費平行視窗 K*
-python3 bench/model.py --churn            # 流水線利用率與節點流失
-python3 bench/model.py --validate         # 對照 Petals 實測值校驗模型
-```
+# 估算效能（不用下載模型，純數學）
+python3 bench/model.py --model 32b --nodes 4
 
-### M1 spike：驗證層切分的數值等價性
-
-```bash
+# 驗證「把模型切開結果還對嗎」
 pip install torch transformers onnx onnxruntime onnxscript
-
 python3 spike/export_shards.py --model HuggingFaceTB/SmolLM2-135M --shards 4 --out out/ --seed 42
 python3 spike/verify_shards.py --dir out/
+
+# 在瀏覽器裡跑
+cd web && npm ci && npm run build && node scripts/prepare-model.mjs
+npm test        # 用 headless 瀏覽器驗證整條流水線
+npm run dev     # 開 http://localhost:8080 自己玩
 ```
-
-實測結果（SmolLM2-135M，30 層，固定輸入 seed=42 / seq=32）：
-
-| 切分數 | logits max abs diff | argmax token 一致 |
-|---|---|---|
-| 2 shard | 7.725e-05 | 32/32 ✅ |
-| 4 shard | 7.725e-05 | 32/32 ✅ |
-| 8 shard | 7.725e-05 | 32/32 ✅ |
-| 15 shard | 7.725e-05 | 32/32 ✅ |
-
-誤差**與切分數完全無關** —— 殘差全部來自 ONNX 對算子本身的匯出，
-切分這個動作是無損的。PyTorch 層級的串接誤差是 0.000e+00。
-
-### M4 spike：激活值量化
-
-```bash
-python3 spike/quant_sweep.py --outliers     # 離群通道統計
-python3 spike/quant_sweep.py --sweep all    # 完整方案掃描 + hop 累積表
-```
-
-線路格式已由實測敲定為 **`per-channel + 前 3% 通道 fp16`**（8.24 bits/值）：
-
-| 方案 | 線路位元 | PPL 退化 | argmax 一致 |
-|---|---|---|---|
-| per-tensor | 8.0 | **+30444%** | 4.30% |
-| per-channel | 8.0 | +6.23% | 85.01% |
-| group-64 | 8.0 | +0.48% | 97.56% |
-| **per-ch + outlier 3%** | **8.2** | **+0.03%** | **99.32%** |
-
-離群比值在 135M 就達 **1212×**（文獻對 6–7B 報告 20–100×）。
-完整數據：[docs/data/quant-results.md](docs/data/quant-results.md)。
 
 ---
 
-## 文件
+## 技術文件
 
-| | |
+這份 README 刻意寫得淺，完整的技術內容在 `docs/`：
+
+| 文件 | 內容 |
 |---|---|
-| [00-feasibility.md](docs/00-feasibility.md) | 可行性評估、量化模型、困難點清單 |
-| [01-architecture.md](docs/01-architecture.md) | 架構規格、解碼協定、線路格式 |
-| [02-roadmap.md](docs/02-roadmap.md) | 里程碑與驗收條件 |
-| [03-open-questions.md](docs/03-open-questions.md) | 待答問題與已知未知數 |
+| [部署指南](docs/DEPLOY.md) | 怎麼部署到 Cloudflare Pages + R2 |
+| [可行性評估](docs/00-feasibility.md) | 量化模型、實測數據、困難點清單 |
+| [架構規格](docs/01-architecture.md) | 解碼協定、線路格式、容錯設計 |
+| [開發路線](docs/02-roadmap.md) | 里程碑與驗收條件 |
+| [待答問題](docs/03-open-questions.md) | 已知的未知數 |
 
 ---
 

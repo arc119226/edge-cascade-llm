@@ -7,3 +7,8 @@ __pycache__/
 .venv/
 venv/
 node_modules/
+
+# web 建置產出與模型檔（可重新產生，體積大）
+web/node_modules/
+web/dist/
+web/dist-assets/

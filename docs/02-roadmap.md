@@ -7,8 +7,8 @@
 |---|---|---|
 | M0 | 數值模型 | ✅ 完成 |
 | M1 | 層切分 + hidden-state I/O（**go/no-go 閘門**） | ✅ **通過** |
-| M2 | 瀏覽器 WebGPU 基線 + roofline 實測 | ⬜ 進行中 |
-| M3 | 雙分頁 WebRTC 流水線 | ⬜ |
+| M2 | 瀏覽器端執行 + 效能量測工具 | ✅ **完成**（WebGPU 數字待實測回報） |
+| M3 | 雙分頁 WebRTC 流水線 | ⬜ 下一步 |
 | M4 | 激活值量化 | ✅ **完成** |
 | M5 | 投機解碼 | ⬜ |
 | M6 | Nostr 信令 + 真實 WAN | ⬜ |
@@ -57,21 +57,44 @@ python3 spike/verify_shards.py --dir out/
 
 ---
 
-## ⬜ M2 — 瀏覽器 WebGPU 基線 + roofline 實測
+## ✅ M2 — 瀏覽器端執行 + 效能量測工具
 
-把 M1 的 shard 搬進瀏覽器，用 onnxruntime-web 的 WebGPU EP 跑起來。
-量測不同 K 的實際吞吐，得出真實的 $K^*$。
+把 M1 的 shard 搬進瀏覽器，用 onnxruntime-web 跑起來。
 
-**驗收**：
-- 單一 shard 在瀏覽器中執行，輸出與 Node/Python 端一致
-- 實測 $K^*$ 與模型預測相差 < 2×
-- 量出真實的每 hop 固定開銷（含 WebGPU dispatch），回頭校正 `bench/model.py`
+**產出**：[`web/`](../web/) —— 可直接部署到 Cloudflare Pages 的靜態站，
+含 shard 流水線執行器、激活值量化（與 Python 版逐值一致）、
+權重快取（Cache API + service worker）、PWA、以及一鍵式效能量測頁。
 
-**否證條件**：若手機上 $K^* < 3$，位置平行的效益空間太小，
-整個投機解碼路線要重新評估。
+**驗收（容器內可驗的部分）**：全數通過。
+`npm test` 用 headless Chromium 跑完整條流水線，
+4 段 / 30 層，max abs diff **1.502e-04**，argmax **16/16 一致**。
 
-**已知風險**：ORT Web 的 WebGPU EP 對某些算子支援不全，可能需要改寫
-匯出圖或 fallback 到 WASM。
+**刻意的分工**：規劃時實測確認**這個開發容器完全沒有 WebGPU**
+（headless shell、完整 chromium、Xvfb + headed、swiftshader 全試過，
+`navigator.gpu` 一律不存在）。所以 M2 拆成兩半：
+
+| 半邊 | 誰做 | 狀態 |
+|---|---|---|
+| 正確性（WASM EP） | 容器內 `npm test` | ✅ 通過 |
+| 效能與 WebGPU 正確性 | 真實裝置開 `bench.html` | ⬜ 待回報 |
+
+`bench.html` 會量 $K^*$、每 hop 固定開銷、以及 WASM 與 WebGPU 的數值差異，
+輸出一段 JSON 貼回來校正 `bench/model.py`。
+在拿到真實數據之前，那些數字在文件中一律標為**未實測**。
+
+**否證條件仍然有效**：若手機上 $K^* < 3$，位置平行的效益空間太小，
+投機解碼路線要重新評估。
+
+**過程中踩到並解決的三件事**：
+1. `.onnx.data` 旁檔 ORT-Web 不會自己抓，必須用 `externalData` 明確餵進去
+2. `wasmPaths` 是相對於 ORT 自己的模組網址解析，不是相對於頁面
+3. WebGPU 版的 wasm 是 28 MB，**超過 Cloudflare Pages 的 25 MiB 單檔上限** ——
+   建置改成把大檔分流到 R2，見 [DEPLOY.md](DEPLOY.md)
+
+```bash
+cd web && npm ci && npm run build && node scripts/prepare-model.mjs
+npm test
+```
 
 ---
 
