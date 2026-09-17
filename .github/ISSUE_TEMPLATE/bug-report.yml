@@ -1,0 +1,47 @@
+name: 回報一個錯誤
+description: 有東西壞了、跑不起來，或是文件寫錯了。
+title: "[錯誤] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        不用擔心「這算不算 bug」。如果你覺得哪裡不對勁，那多半就是不對勁。
+
+        只是想問問題、不確定是不是自己用錯的話，
+        去 [Discussions](https://github.com/arc119226/edge-cascade-llm/discussions)
+        會比開 issue 輕鬆。
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 發生了什麼事
+      description: 你做了什麼、預期會發生什麼、實際發生了什麼。
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: 錯誤訊息（如果有的話）
+      description: 紅字、終端機輸出、瀏覽器 console 的內容，整段貼進來就好。
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: env
+    attributes:
+      label: 環境
+      placeholder: 例如 Windows 11 + Chrome 152 / macOS 15 + Node 22
+    validations:
+      required: false
+
+  - type: textarea
+    id: report
+    attributes:
+      label: 量測頁面的 JSON（如果錯誤發生在量測頁上）
+      description: 有的話貼上來，能省下很多來回。
+      render: json
+    validations:
+      required: false

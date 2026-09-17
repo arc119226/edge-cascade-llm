@@ -1,0 +1,84 @@
+name: 裝置效能回報
+description: 跑完量測頁面，把結果貼回來。這是目前最需要的幫忙。
+title: "[裝置回報] "
+labels: ["device-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        謝謝你願意跑這一趟。
+
+        開發環境裡沒有顯示卡，所以「真實裝置上跑起來是什麼樣子」這件事
+        我們量不到，只能靠你。**不管結果是好是壞、甚至跑失敗，都有用** ——
+        失敗本身就是資料，前幾份回報就是這樣抓出四個 bug 的。
+
+        還沒跑過的話：開啟量測頁面 → 按「開始檢查」→ 按「開始量測」→
+        按「複製結果」，然後貼到下面。全程在你的瀏覽器裡執行，不會上傳任何東西。
+
+  - type: input
+    id: device
+    attributes:
+      label: 這是什麼裝置
+      description: 型號愈具體愈好。報告裡的 userAgent 在 macOS 與 iOS 上會被瀏覽器刻意模糊掉，所以這一欄不能從 JSON 推出來。
+      placeholder: 例如 ThinkPad X1 Carbon Gen 11 / MacBook Air M2 / iPhone 15 Pro / 自組桌機 RTX 4070
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: 作業系統與版本
+      placeholder: 例如 Windows 11 24H2 / macOS 15.2 / Ubuntu 24.04 / iOS 18.2
+    validations:
+      required: true
+
+  - type: dropdown
+    id: browser
+    attributes:
+      label: 瀏覽器
+      options:
+        - Chrome
+        - Edge
+        - Firefox
+        - Safari
+        - Brave / Arc / 其他 Chromium 系
+        - 其他
+    validations:
+      required: true
+
+  - type: dropdown
+    id: power
+    attributes:
+      label: 跑的時候插著電嗎
+      description: 這一欄不是多問的 —— 筆電用電池時顯示卡會降頻，同一台機器的數字可能差好幾倍。
+      options:
+        - 插著電
+        - 用電池
+        - 桌機 / 不適用
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: gpu-tweak
+    attributes:
+      label: 顯示卡設定
+      options:
+        - label: 我有動過瀏覽器或系統的顯示卡偏好設定（例如開了 `chrome://flags/#force-high-performance-gpu`、或在 Windows 顯示卡設定裡把瀏覽器設成高效能）
+          required: false
+
+  - type: textarea
+    id: report
+    attributes:
+      label: 完整的 JSON 結果
+      description: 量測頁面上「複製結果」按鈕複製出來的那一整段，原封不動貼進來就好，不用整理。
+      render: json
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: 其他想說的（選填）
+      description: 哪裡卡住、哪裡看不懂、跑到一半失敗、或者只是覺得哪個說明寫得爛 —— 都歡迎。
+    validations:
+      required: false
