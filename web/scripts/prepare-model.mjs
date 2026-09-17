@@ -12,8 +12,49 @@
  */
 import { cp, mkdir, readdir, writeFile, stat, open } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import path from 'node:path';
+
+/**
+ * 找出這台機器上的 Python 指令。
+ *
+ * 不能寫死 `python3` —— Windows 沒有這個指令。它只有 `python`，
+ * 而且如果使用者沒把 Python 加進 PATH，還有官方安裝程式附的
+ * Python Launcher (`py -3`) 可以用。
+ *
+ * 另外要小心 Windows 的 Microsoft Store 轉址 stub：系統預裝了一個
+ * 叫 python.exe 的東西，執行它會打開市集而不是跑 Python。
+ * 所以不能只看「指令存在不存在」，要真的執行一次確認它會回報版本。
+ */
+function findPython() {
+  const candidates = [
+    ['python3', []],
+    ['python', []],
+    ['py', ['-3']],   // Windows Python Launcher
+  ];
+  for (const [cmd, prefix] of candidates) {
+    const r = spawnSync(cmd, [...prefix, '-c', 'import sys; print(sys.version_info[0])'], {
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    // 市集 stub 會回非零離開碼或印不出東西，這裡一併濾掉
+    if (r.status === 0 && r.stdout.trim() === '3') return { cmd, prefix };
+  }
+  console.error(
+    '找不到可用的 Python。\n' +
+    '  需要 Python 3 才能匯出模型。請先安裝並確認它在 PATH 上：\n' +
+    '    Windows  https://www.python.org/downloads/ （安裝時勾選 "Add python.exe to PATH"）\n' +
+    '    macOS    brew install python\n' +
+    '    Linux    用你的套件管理員安裝 python3\n' +
+    '  已嘗試過的指令：python3、python、py -3',
+  );
+  process.exit(1);
+}
+
+/** 用偵測到的 Python 跑一支腳本。 */
+function runPython(py, args, cwd) {
+  execFileSync(py.cmd, [...py.prefix, ...args], { stdio: 'inherit', cwd, windowsHide: true });
+}
 
 // 20 MiB 而非 25 MiB：留餘裕給傳輸編碼與未來可能的上限調整。
 const CHUNK_BYTES = 20 * 1024 * 1024;
@@ -24,19 +65,18 @@ const srcDir = process.env.SHARD_DIR ?? path.join(repo, 'out');
 const outDir = path.join(root, 'dist', 'model');
 
 if (!existsSync(path.join(srcDir, 'manifest.json'))) {
-  console.log(`找不到 ${srcDir}/manifest.json，改用 Python 匯出一份…`);
-  execFileSync('python3', [
+  const py = findPython();
+  console.log(`找不到 ${srcDir}/manifest.json，改用 ${py.cmd} 匯出一份…`);
+  runPython(py, [
     path.join(repo, 'spike', 'export_shards.py'),
     '--model', process.env.MODEL ?? 'HuggingFaceTB/SmolLM2-135M',
     '--shards', process.env.SHARDS ?? '4',
     '--dtype', process.env.DTYPE ?? 'int4',
     '--out', srcDir,
     '--seed', '42',
-  ], { stdio: 'inherit', cwd: repo });
+  ], repo);
   // native.bin 由 verify_shards.py 產生 —— 瀏覽器端測試要拿它當對照組
-  execFileSync('python3', [
-    path.join(repo, 'spike', 'verify_shards.py'), '--dir', srcDir,
-  ], { stdio: 'inherit', cwd: repo });
+  runPython(py, [path.join(repo, 'spike', 'verify_shards.py'), '--dir', srcDir], repo);
 }
 
 /** 把一個檔案切成 <= CHUNK_BYTES 的片段，回傳片段數（1 表示沒切）。 */

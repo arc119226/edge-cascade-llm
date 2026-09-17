@@ -48,6 +48,60 @@ python3 spike/verify_shards.py --dir out/
 > argmax 只剩 3/16（等於壞掉），8-bit 則有 15/16。
 > 小模型對低位元量化特別敏感；7B 以上的模型通常撐得住 4-bit。
 
+#### Windows 使用者請看這裡
+
+Windows 有兩個地方跟上面的指令不一樣。
+
+**1. `pip` 可能被 Smart App Control 擋下**
+
+如果你看到這個訊息：
+
+```
+'C:\PythonXXX\Scripts\pip.exe' 已被貴組織的 Device Guard 原則封鎖。
+```
+
+這是 **Windows 11 的 Smart App Control**（它用 WDAC 實作，所以訊息裡寫 Device Guard）。
+在個人電腦上這是預設行為，**不代表你的電腦被公司管控**。
+它會擋掉未簽章的執行檔，而 `pip.exe` 正是 pip 產生的未簽章 .exe 外殼。
+
+解法是改走**已簽章的 `python.exe`**，把 pip 當模組執行：
+
+```bat
+python -m pip install torch transformers onnx onnxruntime onnxscript
+```
+
+> ⚠️ **不要為了這件事去關掉 Smart App Control。**
+> 它一旦關閉就**無法再開啟** —— 要重灌 Windows 才能恢復。
+> 用上面那行就解決了，不需要動任何安全設定。
+>
+> 想確認是不是它擋的：事件檢視器 →
+> `應用程式及服務記錄檔 > Microsoft > Windows > CodeIntegrity > Operational`，
+> 事件 3033 / 3077 就是封鎖記錄。
+
+**2. 指令叫 `python`，不是 `python3`**
+
+Windows 沒有 `python3` 這個指令。完整的 Windows 版指令：
+
+```bat
+python -m pip install torch transformers onnx onnxruntime onnxscript
+
+python spike\export_shards.py --model HuggingFaceTB/SmolLM2-135M ^
+       --shards 4 --dtype int4 --out out\ --seed 42
+
+python spike\verify_shards.py --dir out\
+```
+
+（`^` 是 cmd 的換行符號，相當於 Linux 的 `\`。用 PowerShell 的話改用 `` ` ``，
+或直接寫成一行。）
+
+後面的 `npm` 指令跨平台都一樣，不用改。
+`scripts/prepare-model.mjs` 會自己找 `python3` / `python` / `py -3`，
+不必手動設定。
+
+**順帶一提**：Python 3.14 沒問題 —— torch、onnxruntime、onnx 都有對應的
+Windows wheel。torch 的 Windows 版是 CPU build，只有約 124 MB，
+不需要加 `--index-url` 之類的參數。
+
 ### 二、建置
 
 ```bash
@@ -188,6 +242,14 @@ shard_N.onnx   shard_N.onnx.data（或它的 .partN 片段）
 
 **手機跑到一半沒反應**
 多半是記憶體不足被瀏覽器清掉。把模型切更多段（每段更小）再試。
+
+**`找不到可用的 Python`**
+`prepare-model.mjs` 試過 `python3`、`python`、`py -3` 都沒找到。
+Windows 上常見原因是安裝 Python 時沒勾「Add python.exe to PATH」。
+重跑安裝程式選 Modify 補勾，或直接用 `py -3` 確認 Python Launcher 在不在。
+
+> 注意 Windows 內建一個叫 `python.exe` 的 Microsoft Store 轉址 stub，
+> 執行它會打開市集而不是跑 Python。偵測時已經會過濾掉這種情況。
 
 ---
 
