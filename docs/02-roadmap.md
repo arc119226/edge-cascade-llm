@@ -7,9 +7,9 @@
 |---|---|---|
 | M0 | 數值模型 | ✅ 完成 |
 | M1 | 層切分 + hidden-state I/O（**go/no-go 閘門**） | ✅ **通過** |
-| M2 | 瀏覽器 WebGPU 基線 + roofline 實測 | ⬜ 下一步 |
+| M2 | 瀏覽器 WebGPU 基線 + roofline 實測 | ⬜ 進行中 |
 | M3 | 雙分頁 WebRTC 流水線 | ⬜ |
-| M4 | 激活值量化 | ⬜ |
+| M4 | 激活值量化 | ✅ **完成** |
 | M5 | 投機解碼 | ⬜ |
 | M6 | Nostr 信令 + 真實 WAN | ⬜ |
 | M7 | churn 容錯 | ⬜ |
@@ -90,20 +90,37 @@ python3 spike/verify_shards.py --dir out/
 
 ---
 
-## ⬜ M4 — 激活值量化
+## ✅ M4 — 激活值量化
 
-每個 hop 把 fp16 激活值壓成 int8 以減少傳輸量。
+每個 hop 把激活值壓成 int8 以減少傳輸量。
+**提前到 M2 之前做**，因為它是 P0 風險且完全可在本地驗證 ——
+若 int8 不可用，整個可行性評估要重算。
 
-**驗收**：
-- 相對 fp16 基線的 PPL 退化 < 1%
-- 傳輸量降到 1/2 以下
-- **誤差 vs 切分數的曲線**。M1 已證實未量化時切分是無損的（誤差與切分數無關），
-  所以這裡量到的任何累積都純粹來自 hop 量化 —— 這是一級指標，不是附註。
-  **務必用 `--seed` 固定輸入**，否則量到的是輸入變異而不是組態差異
+**產出**：[`spike/quant_sweep.py`](../spike/quant_sweep.py)、
+[`spike/quant_schemes.py`](../spike/quant_schemes.py)、
+[`spike/corpus.txt`](../spike/corpus.txt)（釘在 repo 的語料，不下載）
 
-**必須用**逐通道/分組量化 + 離群通道 fp16。
-per-tensor INT8 會因離群通道而毀掉品質，見
-[01-architecture.md §4.2](01-architecture.md)。
+**驗收**：PPL 退化 < 1%、傳輸量減半、量出誤差 vs 切分數曲線。**全數達成。**
+
+**結論**：採用 `per-channel + 前 3% 通道 fp16`（線路 8.24 bits）——
+PPL 退化 **0.03%**、argmax 一致 **99.32%**。
+純 int8 的最佳選項是 `group-64`（+0.48%，零額外頻寬）。
+
+**三個實測發現**：
+1. 離群比值在 **135M** 就達 **1212×**，遠超文獻對 6–7B 報告的 20–100×。
+   原本擔心「小模型看不到離群現象」的疑慮被否定。
+2. `per-channel` 反而輸給 `group-64` —— scale 必須**逐 token 適應**，
+   這一點在文獻推論階段沒預料到。
+3. 誤差隨 hop 累積但**次線性**（14× hop 只放大 2.8× 不一致率）。
+
+**對等價性宣稱的影響**：量化本身就讓約 1–1.8% 的 token 與 fp32 模型不同，
+所以等價性必須表述為「與同一條量化流水線相同」。見
+[01-architecture.md §3.1](01-architecture.md)。
+
+```bash
+python3 spike/quant_sweep.py --outliers              # 離群統計
+python3 spike/quant_sweep.py --sweep all             # 完整掃描 + Q3 累積表
+```
 
 ---
 

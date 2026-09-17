@@ -167,7 +167,11 @@ METHODS = {
     "pipeline": DecodeMethod("naive pipeline", 0.0, 1.0),
 }
 
-ACT_BITS = {"fp16": 16, "int8": 8, "int4": 4}
+# 激活值在線路上的等效位元數。
+# "wire" 是 M4 實測敲定的格式：per-channel int8 + 前 3% 通道保留 fp16，
+# 等效 8.24 bits/值，PPL 退化 0.03%。這是預設值。
+# 純 int8（per-tensor）實測不可用 —— PPL 暴增 30444%，見 docs/00-feasibility.md §6。
+ACT_BITS = {"fp16": 16, "wire": 8.24, "int8": 8, "int4": 4}
 
 # Petals 堆疊（Python + PyTorch + 原生 CUDA）每個 hop 的固定開銷。
 # 這個值不是獨立量來的，是從 Petals 的低延遲測量點（176B, 100Mbps, <5ms RTT
@@ -528,8 +532,9 @@ def main() -> None:
                     help=f"逗號分隔，循環填滿 P 個節點。可用：{', '.join(DEVICES)}")
     ap.add_argument("--rtt", type=float, default=50, help="節點間 RTT (ms)")
     ap.add_argument("--mbps", type=float, default=20, help="上行頻寬 (Mbps)")
-    ap.add_argument("--act", default="int8", choices=sorted(ACT_BITS),
-                    help="激活值傳輸精度")
+    ap.add_argument("--act", default="wire", choices=sorted(ACT_BITS),
+                    help="激活值傳輸精度。預設 'wire' 是 M4 實測敲定的格式"
+                         "（per-channel int8 + 3%% 通道 fp16，等效 8.24 bits）")
     ap.add_argument("--overhead", type=float, default=15.0,
                     help="每個 pipeline hop 的固定軟體開銷 (ms)：序列化 + 框架 dispatch "
                          "+ WebGPU kernel launch。低延遲情境下會成為主導項。")
