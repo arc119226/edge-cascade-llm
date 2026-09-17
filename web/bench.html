@@ -48,11 +48,10 @@
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   progress { width: 100%; height: 6px; }
   label { font-size: 14px; color: var(--dim); }
-  input[type=text], select {
+  input[type=text] {
     background: #080c18; border: 1px solid var(--line); color: var(--fg);
     border-radius: 6px; padding: 8px; font-size: 14px; width: 100%;
   }
-  select:disabled { opacity: .6; }
 </style>
 </head>
 <body>
@@ -72,15 +71,6 @@
       <button id="btn-env">開始檢查</button>
     </div>
     <div id="env-out"></div>
-    <!-- 只有偵測到兩張不同的顯示卡時才顯示（見 bench-ui.js）。 -->
-    <div id="gpu-pick" hidden style="margin-top:12px">
-      <label for="gpu-pref">要用哪一張顯示卡量測</label>
-      <select id="gpu-pref">
-        <option value="high-performance">高效能（獨立顯卡）</option>
-        <option value="low-power">省電（內建顯卡）</option>
-      </select>
-      <div class="dim" id="gpu-pick-note" style="font-size:13px; margin-top:6px"></div>
-    </div>
   </div>
 
   <div class="card">

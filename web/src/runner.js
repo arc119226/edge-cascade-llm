@@ -15,20 +15,25 @@ import { fetchShard } from './cache.js';
 /**
  * ORT 的全域設定。必須在建立任何 session 之前呼叫。
  *
- * `powerPreference` 特別重要，而且是踩過坑學到的：ORT-Web 的 WebGPU 後端
- * **自己**會呼叫一次 `navigator.gpu.requestAdapter()`，用的是
- * `ort.env.webgpu.powerPreference`，完全不理會我們在 detectProviders()
- * 裡挑到的那個 adapter。所以混合顯卡的機器上，只修偵測而不設這個值，
- * 會變成「報告上寫獨立顯卡、實際跑內顯」—— 比沒偵測到還糟。
+ * ⚠ `powerPreference` 在 ORT 1.30 是 **no-op**，別指望它能換顯示卡。
  *
- * ORT 1.30 把這個屬性標成 deprecated，建議改成自己建 GPUDevice 塞進
- * `env.webgpu.device`。那條路現在不走：自建 device 就得自己複製 ORT
- * 對 features（shader-f16、subgroups）與各項 limits 的整套要求，
- * 漏一項就是變慢或直接建不起來。等 powerPreference 真的被移除再改。
+ * 追過原始碼：`ort.webgpu.mjs:3216` 確實依這個值呼叫了
+ * `navigator.gpu.requestAdapter()`，但拿到的 adapter 只存在區域變數裡；
+ * 真正初始化走的是 3243 行的
+ * `getInstance().webgpuInit((device) => { env.webgpu.device = device; })` ——
+ * **adapter 沒有被傳進去**。唯一會用到它的是 `if (false)` 包起來的 JSEP 死碼。
+ *
+ * 那還設它幹嘛？因為它符合規格、只有一行，未來 ORT 修好就自動生效。
+ * 但**不能拿它當「已經指定顯示卡」的依據** —— 報告要用 actualAdapterInfo()
+ * 去問實際建立的 device，那才是事實。
+ *
+ * 真的要釘住顯示卡只有一條路：自己建 GPUDevice，用
+ * `executionProviders: [{ name: 'webgpu', device }]` 逐 session 傳進去
+ * （見 `ort.webgpu.mjs:1994-2033`）。代價是要自己複製 ORT 對 features
+ * 與 limits 的整套要求，而且在 Windows 上也換不到獨顯（見 detectProviders）。
  */
 export function configureOrt(ort, { wasmPaths, numThreads, powerPreference } = {}) {
   if (powerPreference && ort.env.webgpu) {
-    // 只在第一個 WebGPU session 建立之前設定才有效果。
     ort.env.webgpu.powerPreference = powerPreference;
   }
   if (wasmPaths) {
@@ -50,16 +55,37 @@ export function configureOrt(ort, { wasmPaths, numThreads, powerPreference } = {
 }
 
 /**
- * ORT 實際拿到的是哪一張顯示卡。
+ * ORT 實際拿到的是哪一張顯示卡。只有在第一個 WebGPU session 建立之後才問得到。
  *
- * 只有在第一個 WebGPU session 建立之後才問得到。這個欄位存在的理由很單純：
- * 沒有它，我們只是在「相信」上面設的 powerPreference 生效了。
+ * 這個函式存在的理由很單純：沒有它，我們只是在「相信」自己設的偏好生效了。
  * 報告要能自己證明它量的是哪張卡。
+ *
+ * ⚠ 不要改回讀 `env.webgpu.adapter` —— 那個欄位**永遠是 undefined**。
+ * ORT 1.30 只在 `ort.webgpu.mjs:3202` 讀它，3216 行把 requestAdapter 的結果
+ * 指派給區域變數，全檔沒有任何地方寫回去。（上一版就是栽在這裡，
+ * 使用者回報的 actualAdapter 是 null。）
+ *
+ * 會被寫入的是 `env.webgpu.device`（3243 行的 callback），
+ * 再從 WebGPU 規格的 `GPUDevice.adapterInfo` 取資訊。
  */
-export function actualAdapterInfo(ort) {
-  const adapter = ort?.env?.webgpu?.adapter;
-  if (!adapter?.info) return null;
-  return describeAdapter(adapter);
+export async function actualAdapterInfo(ort) {
+  try {
+    // 型別宣告上 device 是個 getter 回 Promise，實作上是直接指派的值。
+    // Promise.resolve 兩種都吃得下。
+    const device = await Promise.resolve(ort?.env?.webgpu?.device);
+    const info = device?.adapterInfo;
+    if (!info) return null;
+    return {
+      vendor: info.vendor ?? null,
+      architecture: info.architecture ?? null,
+      device: info.device ?? null,
+      description: info.description ?? null,
+      source: 'GPUDevice.adapterInfo',
+    };
+  } catch {
+    // 沒有 WebGPU、或 session 還沒建立。兩種都是正常情況，不該讓報告掛掉。
+    return null;
+  }
 }
 
 /** 把一個 GPUAdapter 攤平成可以塞進 JSON 報告的樣子。 */
@@ -99,15 +125,23 @@ async function tryAdapter(options) {
 /**
  * 偵測這台裝置支援哪些 execution provider。
  *
- * 混合顯卡（筆電內顯 + 獨立顯卡）要特別處理：不帶 `powerPreference` 呼叫
- * `requestAdapter()` 時，瀏覽器回的是**內顯**。使用者回報「我的 NVIDIA
- * 沒被偵測到」就是這個原因 —— 那張卡一直都在，只是我們沒問對問題。
+ * 這裡把 high-performance 與 low-power 兩個偏好**都探一次**，但目的不是
+ * 讓使用者選 —— 而是**蒐集證據**。
  *
- * 所以這裡把 high-performance 與 low-power 兩個都探一次：
- *   - `out.adapter`  實際會拿去跑的那一張
- *   - `out.adapters` `{ chosen, other, distinct }`，兩張都列出來
+ * 背景：使用者回報「我的 NVIDIA 沒被偵測到」。第一次以為是我們沒帶
+ * `powerPreference`，加上去之後仍然只拿到 Intel 內顯，兩個偏好回傳的
+ * adapter 連 limits 都一模一樣。查 Chrome 官方文件才知道這是設計如此：
+ * Windows 上 powerPreference「doesn't have any impact」，而且 Chrome
+ * 「does not support using multiple GPU adapters simultaneously」——
+ * 它只用啟動時分配到的那張，筆電上通常是內顯。
  *
- * 單顯卡機器上兩次會拿到同一張，`distinct: false`，UI 就不用多講什麼。
+ * 所以網頁這一端換不了卡，能做的是**把這件事說清楚**：
+ *   - `out.adapter`      實際拿到的那一張
+ *   - `out.adapters`     `{ chosen, other, distinct }`
+ *   - `out.singleAdapter` 兩個偏好拿到同一張 —— 瀏覽器只給得出一張卡
+ *
+ * `singleAdapter` 為真時，UI 會告訴使用者去
+ * `chrome://flags/#force-high-performance-gpu` 或 Windows 顯示卡設定換。
  *
  * @param {{powerPreference?: 'high-performance'|'low-power'}} opts
  */
@@ -117,6 +151,7 @@ export async function detectProviders({ powerPreference = 'high-performance' } =
     webgpu: false,
     adapter: null,
     adapters: null,
+    singleAdapter: null,
     powerPreference,
     reason: null,
   };
@@ -157,6 +192,7 @@ export async function detectProviders({ powerPreference = 'high-performance' } =
       // 探不到另一張時不算「有兩張」—— 不然單顯卡機器會被誤報成雙顯卡。
       distinct: otherInfo != null && !sameAdapter(out.adapter, otherInfo),
     };
+    out.singleAdapter = !out.adapters.distinct;
   } catch (e) {
     out.reason = `requestAdapter 失敗：${e}`;
   }
