@@ -1,19 +1,22 @@
 /**
- * 安裝匯出模型所需的 Python 套件。
+ * 在 repo 根目錄建立虛擬環境，並把匯出模型所需的 Python 套件裝進去。
  *
- * 為什麼要包成一支腳本，而不是叫使用者自己打 pip：
+ * **不會動到你的全域 Python。** 這一點是刻意的，而且是踩過坑學到的：
  *
- * 1. **指令名稱在各平台不同** —— Windows 沒有 `python3`。
- * 2. **`pip` 在 Windows 11 上可能被擋** —— Smart App Control 會封鎖未簽章的
- *    執行檔，而 `pip.exe` 正是 pip 產生的未簽章外殼，訊息還會誤導成
- *    「已被貴組織的 Device Guard 原則封鎖」，讓人以為電腦被公司管控。
- *    走 `python -m pip` 就沒事，因為 `python.exe` 有簽章。
+ * 早期版本直接對全域環境跑 `pip install --upgrade`，結果把使用者原本的
+ * CUDA 版 torch（`2.10.0+cu128`）換成了 PyPI 的 CPU 版（`2.14.0`），
+ * 連帶弄壞依賴它的 torchaudio。一個專案的安裝腳本沒有資格改動使用者
+ * 其他專案共用的套件版本 —— 在隔離的 venv 裡升級才是安全的。
  *
- * 使用者不需要知道上面任何一件事，跑 `npm run setup` 就好。
+ * 另外順便處理掉 Windows 的兩個陷阱，使用者不需要知道它們存在：
+ *   - `python3` 可能是 App Execution Alias 轉址 stub（見 python.mjs）
+ *   - `pip.exe` 未簽章，可能被 Smart App Control 擋下 —— 走 `python -m pip` 就沒事
  */
 
+import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { findPython, runPython, describe } from './python.mjs';
+import { execFileSync } from 'node:child_process';
+import { findPython, runPython, describe, venvPython, VENV_DIR } from './python.mjs';
 
 // transformers 釘在 v5 以上：本專案用 v5 的 API（例如 from_pretrained 的
 // `dtype` 參數，v4 只認得 `torch_dtype`）。不寫相容層，因為 v4 的失敗是從
@@ -27,16 +30,38 @@ const PACKAGES = [
 ];
 
 const repo = path.resolve(import.meta.dirname, '..', '..');
-const py = findPython();
 
-console.log(`使用 ${describe(py)} 安裝：${PACKAGES.join(' ')}`);
+// 1. 確保 venv 存在
+if (!existsSync(venvPython())) {
+  const system = findPython();
+  console.log(`建立虛擬環境 ${VENV_DIR}`);
+  console.log(`（用 ${describe(system)}；套件會裝在這裡，不會動到你的系統 Python）\n`);
+  try {
+    runPython(system, ['-m', 'venv', VENV_DIR], repo);
+  } catch {
+    console.error('\n建立虛擬環境失敗。');
+    console.error('  Debian/Ubuntu 上可能要先裝 venv 模組：sudo apt install python3-venv');
+    process.exit(1);
+  }
+} else {
+  console.log(`沿用既有的虛擬環境 ${VENV_DIR}\n`);
+}
+
+// 2. findPython() 現在會優先挑到 venv 裡的 python
+const py = findPython();
+if (!py.cmd.startsWith(VENV_DIR)) {
+  // 走到這裡代表 venv 存在但不能執行（例如換過 Python 版本、或目錄被搬動過）。
+  // 繼續裝下去會污染全域環境，正是這次要避免的事，所以直接停。
+  console.error(`虛擬環境存在但無法執行：${venvPython()}`);
+  console.error('  請刪掉 .venv 之後重跑 npm run setup。');
+  process.exit(1);
+}
+
+console.log(`安裝套件：${PACKAGES.join(' ')}`);
 console.log('（走 python -m pip，而不是 pip.exe —— 後者在 Windows 11 上可能被 Smart App Control 擋下）\n');
 
 try {
-  // --upgrade 是必要的：`pip install X` 對已安裝的套件會直接說
-  // 「Requirement already satisfied」而不升級。使用者若早就裝過舊版
-  // transformers，就會拿到一個與本專案不相容的版本 ——
-  // 實際踩過：transformers 4.x 不認得 from_pretrained 的 dtype 參數。
+  // --upgrade 在 venv 裡是安全的：影響範圍只有這個專案。
   runPython(py, ['-m', 'pip', 'install', '--upgrade', ...PACKAGES], repo);
 } catch {
   // execFileSync 在子程序失敗時會拋，但 pip 自己的錯誤訊息已經印出來了，
@@ -45,8 +70,8 @@ try {
   console.error('常見狀況：');
   console.error('  - 磁碟空間不足（torch 解壓後約 1 GB）');
   console.error('  - 網路或代理伺服器問題');
-  console.error(`  - Python 版本太舊：請確認 ${describe(py)} --version 是 3.10 以上`);
   process.exit(1);
 }
 
-console.log('\n✓ 套件安裝完成。接下來執行：npm run deploy');
+console.log('\n✓ 套件安裝完成（裝在 .venv，你的系統 Python 未被更動）。');
+console.log('  接下來執行：npm run deploy');
