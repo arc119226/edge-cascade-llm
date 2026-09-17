@@ -42,6 +42,16 @@ class FakeChannel {
     /** 超過 maxMessageSize 的 send()。這個陣列必須永遠是空的。 */
     this.violations = [];
     this.bytesDelivered = 0;
+    /**
+     * onDeliver（實務上就是 receiver.handle）丟出來的例外。
+     *
+     * 這裡不能讓例外直接從 _tick 往外噴：那是在 setTimeout 回呼裡，噴出去之後
+     * 「重排下一次 tick」那行就不會執行，佇列從此不再排空，而 flush() 的
+     * `while (this._queue.length)` 會永遠輪詢下去 —— node --test **整個掛住**，
+     * CI 只會看到逾時，連哪個測試壞了都不知道。掛住的測試比紅的測試更糟。
+     * 所以收集起來，由 flush() / assertDelivered() 明確丟給測試。
+     */
+    this.deliverErrors = [];
     this.sendsWhileClosed = 0;
     this.peakBufferedAmount = 0;
     this.bufferedAmountReads = 0;
@@ -125,22 +135,40 @@ class FakeChannel {
     this._timer = null;
     if (this.readyState !== 'open') return;
     let budget = this.drainPerTick;
-    while (budget > 0 && this._queue.length) {
-      const head = this._queue[0];
-      const remaining = this._headRemaining || head.byteLength;
-      const take = Math.min(budget, remaining);
-      budget -= take;
-      this._setBuffered(this._buffered - take);
-      if (take === remaining) {
-        this._queue.shift();
-        this._headRemaining = 0;
-        this.bytesDelivered += head.byteLength;
-        if (this.onDeliver) this.onDeliver(head);
-      } else {
-        this._headRemaining = remaining - take;
+    // 有界：每一圈不是把隊頭送完（佇列變短）就是把 budget 用完（迴圈結束），
+    // 所以圈數不會超過目前的佇列長度。寫成上界而不是靠 `budget > 0`，
+    // 是因為一個 byteLength 為 0 的隊頭會讓 take 也是 0 —— budget 不減、
+    // 佇列不縮，就地空轉。假 channel 卡住的代價是整個測試檔掛住。
+    let guard = this._queue.length + 1;
+    try {
+      while (budget > 0 && this._queue.length && guard-- > 0) {
+        const head = this._queue[0];
+        const remaining = this._headRemaining || head.byteLength;
+        const take = Math.min(budget, remaining);
+        budget -= take;
+        this._setBuffered(this._buffered - take);
+        if (take >= remaining) {
+          this._queue.shift();
+          this._headRemaining = 0;
+          this.bytesDelivered += head.byteLength;
+          if (this.onDeliver) {
+            try {
+              this.onDeliver(head);
+            } catch (err) {
+              // 接收端拒絕一塊 chunk 是被測行為之一（畸形、超過上限、重播……），
+              // 不是假 channel 壞了。記下來繼續排空，讓測試自己決定怎麼斷言。
+              this.deliverErrors.push(err);
+            }
+          }
+        } else {
+          this._headRemaining = remaining - take;
+        }
       }
+    } finally {
+      // finally：上面任何一個意料外的例外都不該讓排空永久停擺，
+      // 否則下一個等 flush() 的人會等到天荒地老。
+      if (this._queue.length && this.readyState === 'open') this._schedule();
     }
-    if (this._queue.length) this._schedule();
   }
 
   _setBuffered(next) {
@@ -152,9 +180,39 @@ class FakeChannel {
     }
   }
 
-  /** 等到全部送出佇列排空（測試用，不是被測程式的一部分）。 */
-  async flush() {
-    while (this._queue.length) await new Promise((r) => setTimeout(r, 0));
+  /**
+   * 等到全部送出佇列排空（測試用，不是被測程式的一部分）。
+   *
+   * 有界 + 偵測停滯：原本是 `while (this._queue.length) await sleep(0)`，
+   * 只要排空停下來就是無限輪詢。現在只要連續 maxStallPolls 次都沒有任何位元組
+   * 送達就丟錯，測試會**紅**而不是**掛**。
+   * 最後再把接收端丟出來的例外轉交給測試 —— 吞掉它等於讓 receiver 的錯誤
+   * 變成靜默失敗，而這個模組整個存在的理由就是不要靜默失敗。
+   */
+  async flush({ maxStallPolls = 50 } = {}) {
+    let stalled = 0;
+    let lastDelivered = -1;
+    while (this._queue.length) {
+      if (this.readyState !== 'open') break; // 被送死的 channel 不會再排空了
+      if (this.bytesDelivered === lastDelivered) {
+        if (++stalled > maxStallPolls) {
+          throw new Error(
+            `FakeChannel.flush()：佇列還剩 ${this._queue.length} 塊，但連續 ${maxStallPolls} ` +
+            '次輪詢都沒有任何位元組送達 —— 排空停擺了。',
+          );
+        }
+      } else {
+        stalled = 0;
+        lastDelivered = this.bytesDelivered;
+      }
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    this.assertDelivered();
+  }
+
+  /** 接收端在 onDeliver 裡丟過例外的話，在這裡原封不動地重新丟給測試。 */
+  assertDelivered() {
+    if (this.deliverErrors.length) throw this.deliverErrors[0];
   }
 }
 
@@ -171,8 +229,22 @@ function payload(n, seed = 0x9e3779b9) {
   return out;
 }
 
-/** 手工組一個 chunk，用來測畸形輸入。 */
-function mkChunk(messageId, chunkIndex, chunkCount, payloadLen = 4) {
+/**
+ * 合法送出端對這一塊會用的酬載長度：非最後一塊一定是滿的 16376，
+ * 最後一塊才可以短。預設值要合規，否則「手工組的畸形 chunk」會混進
+ * 那些只想測別的東西的測試裡，把酬載長度的檢查誤報成別的錯。
+ */
+function conformingPayloadLen(chunkIndex, chunkCount) {
+  return chunkIndex === chunkCount - 1 ? 4 : MAX_PAYLOAD;
+}
+
+/** 手工組一個 chunk，用來測畸形輸入。payloadLen 不給就是合規的長度。 */
+function mkChunk(
+  messageId,
+  chunkIndex,
+  chunkCount,
+  payloadLen = conformingPayloadLen(chunkIndex, chunkCount),
+) {
   const buf = new ArrayBuffer(CHUNK_HEADER_SIZE + payloadLen);
   const v = new DataView(buf);
   v.setUint32(0, messageId, true);
@@ -343,9 +415,17 @@ test('畸形 chunk 一律明確報錯，不靜默丟棄', () => {
   assert.throws(() => receiver.handle(mkChunk(2, 0, 3)), /重複/);
   // 5. 同一個 messageId 的 chunkCount 前後不一致
   assert.throws(() => receiver.handle(mkChunk(2, 1, 4)), /前後不一致/);
-  // 6. 字串（binaryType 沒設成 arraybuffer 的典型症狀）
-  assert.throws(() => receiver.handle({ data: 'hello' }), /binaryType/);
-  // 7. 完全不是位元組的東西
+  // 6. Blob —— 這才是「忘了設 binaryType」的症狀（§4.4：預設值是 'blob'），
+  //    所以可以照著做的那句提示要掛在這裡。
+  assert.throws(() => receiver.handle({ data: new Blob([new Uint8Array(16)]) }), /binaryType/);
+  // 7. 字串：對端真的送了文字。和 binaryType 無關，提示掛在這裡等於誤導 ——
+  //    兩句原本是反的，這個斷言就是用來釘住「不准再換回去」。
+  assert.throws(
+    () => receiver.handle({ data: 'hello' }),
+    (err) => /字串/.test(err.message) && !/binaryType/.test(err.message),
+    '字串分支不該提 binaryType：對端送字串跟 binaryType 沒有關係',
+  );
+  // 8. 完全不是位元組的東西
   assert.throws(() => receiver.handle({ data: 42 }), /必須是 ArrayBuffer/);
 
   // 被拒絕的 chunk 不該汙染狀態：messageId 2 仍只有 chunk 0。
@@ -399,4 +479,186 @@ test('send() 要等到全部 chunk 都交給 channel 才 resolve', async () => {
   assert.ok(channel.sentSizes.length < expectedChunks(n), 'send() 不該同步送完全部 chunk');
   await p;
   assert.equal(channel.sentSizes.length, expectedChunks(n), 'resolve 時必須每一塊都交出去了');
+});
+
+test('receiver 丟出來的例外要浮到測試面前，不能把假 channel 卡死', async () => {
+  // 這個測試同時是 FakeChannel 自己的回歸測試：舊版的 _tick 沒有 try，
+  // 第一塊被拒之後例外從 setTimeout 回呼噴出去、排空永久停擺，
+  // flush() 的無界輪詢就讓整個 node --test 掛住。掛住 = CI 逾時 = 零訊號。
+  const receiver = createReceiver(() => {}, { maxInFlight: 1 });
+  receiver.handle(mkChunk(999, 0, 2)); // 唯一的名額先佔走
+
+  const channel = new FakeChannel({ onDeliver: (buf) => receiver.handle({ data: buf }) });
+  const sender = createSender(channel);
+  await sender.send(payload(MAX_PAYLOAD * 2, 5).buffer);
+
+  await assert.rejects(
+    () => channel.flush(),
+    /已達上限 1 則/,
+    'flush() 必須把接收端的例外交出來，不能吞掉也不能卡住',
+  );
+  assert.equal(channel.deliverErrors.length, 2, '兩塊都該被拒，而且兩個例外都要留著');
+  assert.equal(channel.bytesDelivered, 2 * CHUNK_SIZE, '被拒之後仍然要把佇列排空');
+});
+
+test('長度 0 的訊息也要真的送出一塊（Math.max(1, …) 的那個 1）', async () => {
+  const received = [];
+  const receiver = createReceiver((buf) => received.push(buf));
+  const channel = new FakeChannel({ onDeliver: (buf) => receiver.handle({ data: buf }) });
+  const sender = createSender(channel);
+
+  await sender.send(new ArrayBuffer(0));
+  await channel.flush();
+
+  // Math.ceil(0 / 16376) 是 0：少了 Math.max(1, …) 這則訊息會一塊都不上線，
+  // 送出端一切正常返回，對面則永遠等不到 —— 看起來像對方沒回應。
+  assert.equal(sender.stats().chunksSent, 1, '長度 0 的訊息也必須送出剛好一塊');
+  assert.deepEqual(channel.sentSizes, [CHUNK_HEADER_SIZE], '那一塊就是純子標頭');
+  assert.equal(received.length, 1, '對面必須收到一則空訊息，而不是什麼都收不到');
+  assert.equal(received[0].byteLength, 0);
+  assert.equal(receiver.stats().inFlight, 0);
+});
+
+test('超過 chunkCount u16 上限的訊息，在送出任何一塊之前就丟錯', async () => {
+  // 65535 * 16376 = 1,073,086,360 是還塞得進 u16 的最大訊息。再多一個位元組
+  // 就要 65536 塊（寫進 u16 變成 0），65537 塊則變成 1 ——
+  // 後者最陰險：收端會把第 0 塊當成一則完整訊息交付，靜默截斷成 16376 位元組。
+  // 兩個尺寸都只配置不寫入，所以沒有真的吃掉 1 GB 實體記憶體。
+  for (const chunks of [65536, 65537]) {
+    const channel = new FakeChannel();
+    // 任何一塊上線都算失敗：這不是「送到一半才發現」，是根本不該開始送。
+    channel.send = () => { throw new Error('超過上限的訊息不該有任何一塊上線'); };
+    const sender = createSender(channel);
+
+    const tooBig = new ArrayBuffer(MAX_PAYLOAD * (chunks - 1) + 1);
+    await assert.rejects(
+      () => sender.send(tooBig),
+      /超過 chunkCount u16 的上限 65535/,
+      `${chunks} 塊的訊息必須被擋下來`,
+    );
+    assert.deepEqual(channel.sentSizes, [], `${chunks} 塊：不該有任何 chunk 交給 channel`);
+    assert.equal(sender.stats().chunksSent, 0);
+    assert.equal(sender.stats().messagesSent, 0);
+  }
+});
+
+test('每一塊的酬載長度都要驗，截斷的 chunk 不准靜默重組成短訊息', () => {
+  const received = [];
+  const receiver = createReceiver((buf) => received.push(buf));
+
+  // 沒有這道檢查時：idx0 給 100 位元組、idx1 給 4 位元組，
+  // onMessage 會收到一則 104 位元組的訊息、inFlight 歸零、全程無錯。
+  // 但 chunkCount=2 的合法送出端一定送了 16376 + N。
+  assert.throws(
+    () => receiver.handle(mkChunk(1, 0, 2, 100)),
+    /非最後一塊必須剛好是 16376 位元組/,
+    '被截斷的非最後一塊必須被拒絕',
+  );
+  assert.equal(received.length, 0);
+  assert.equal(receiver.stats().inFlight, 0, '畸形的 chunk 不該佔掉 in-flight 名額');
+
+  // 合規的版本仍然要收：最後一塊才可以短。
+  receiver.handle(mkChunk(1, 0, 2));
+  receiver.handle(mkChunk(1, 1, 2, 4));
+  assert.equal(received.length, 1);
+  assert.equal(received[0].byteLength, MAX_PAYLOAD + 4);
+
+  // 多塊訊息的最後一塊不准是空的（那代表送出端多切了一塊）。
+  assert.throws(() => receiver.handle(mkChunk(2, 1, 2, 0)), /合法範圍是 1\.\.16376/);
+  // 單塊訊息的 0 才是合法的空訊息。
+  receiver.handle(mkChunk(3, 0, 1, 0));
+  assert.equal(received.length, 2);
+  assert.equal(received[1].byteLength, 0);
+
+  // 另一個方向：單一塊 200000 位元組（總長 200008）原本也照單全收。
+  assert.throws(
+    () => receiver.handle(mkChunk(4, 0, 1, 200000)),
+    /超過 CHUNK_SIZE 16384/,
+    '沒有任何合法送出端能產生大於 CHUNK_SIZE 的 chunk',
+  );
+  assert.equal(receiver.stats().inFlight, 0);
+});
+
+test('重播一則已經交付的訊息要丟錯，而且記憶是有界的', () => {
+  const received = [];
+  const receiver = createReceiver((buf) => received.push(buf), { maxInFlight: 2 });
+
+  // 沒有這張表時：同一塊餵兩次，onMessage 觸發**兩次**、一個錯都沒有，
+  // 下游把同一個 frame 算兩遍 —— 而模組自己的訊息說重送不該發生。
+  receiver.handle(mkChunk(1, 0, 1));
+  assert.equal(received.length, 1);
+  assert.throws(() => receiver.handle(mkChunk(1, 0, 1)), /是重播/);
+  assert.equal(received.length, 1, 'onMessage 不該為同一則訊息觸發第二次');
+
+  // 多塊版本更糟：重播 chunk 0 會開一個永遠補不滿的新 entry，
+  // 白佔一個 in-flight 名額到 channel 重建為止。
+  receiver.handle(mkChunk(2, 0, 2));
+  receiver.handle(mkChunk(2, 1, 2));
+  assert.equal(received.length, 2);
+  assert.throws(() => receiver.handle(mkChunk(2, 0, 2)), /是重播/);
+  assert.equal(receiver.stats().inFlight, 0, '重播不該佔住 in-flight 名額');
+
+  // 有界是刻意的：全部記下來才是真的無上限成長。界線寫死在測試裡，
+  // 這樣「安靜地把環改小」會被抓到，而不是變成一條測不到的行為。
+  const memory = receiver.stats().completedMemory;
+  assert.equal(memory, 64);
+  for (let id = 100; id < 100 + memory; id++) receiver.handle(mkChunk(id, 0, 1));
+  receiver.handle(mkChunk(1, 0, 1)); // 訊息 1 已經被擠出環外，這一層抓不到了
+  assert.equal(received.length, 2 + memory + 1, '超過記憶長度的重播會被當成新訊息收下');
+});
+
+test('重組一定要複製：對端把每塊都搬進同一塊暫存區時也要正確', async () => {
+  const received = [];
+  const receiver = createReceiver((buf) => received.push(buf));
+
+  // node-datachannel / ws 這類 Node 端綁定就是這樣餵資料的：一塊重複使用的
+  // scratch buffer，回呼一返回就被下一塊覆寫。handle() 收 TypedArray 是公開
+  // 契約的一部分，所以這個用法合法。
+  // entry.parts 若是 subarray（視圖）而不是 slice（複製），重組出來的長度
+  // 完全正確、一個錯都不會報，內容卻是「最後一塊重複 N 次」——
+  // 而 FakeChannel 每塊都給新 buffer，所以這條路徑沒有這個測試就永遠測不到。
+  const scratch = new Uint8Array(CHUNK_SIZE);
+  const channel = new FakeChannel({
+    onDeliver: (buf) => {
+      const src = new Uint8Array(buf);
+      scratch.fill(0);
+      scratch.set(src);
+      receiver.handle(scratch.subarray(0, src.byteLength));
+    },
+  });
+  const sender = createSender(channel);
+
+  const src = payload(MAX_PAYLOAD * 2 + 7, 99);
+  await sender.send(src.buffer);
+  await channel.flush();
+
+  assert.equal(received.length, 1);
+  assert.equal(received[0].byteLength, src.byteLength);
+  assert.equal(
+    Buffer.compare(Buffer.from(received[0]), Buffer.from(src.buffer)), 0,
+    '重組結果不對 —— parts 存的是共用暫存區的視圖，不是複製',
+  );
+});
+
+test('門檻與上限用 Number.isFinite / isInteger 驗，不是用比較', () => {
+  // NaN 的任何比較都是 false，所以 `lowWater >= highWater` 放行了 NaN，
+  // 之後 `bufferedAmount > NaN` 也永遠是 false：背壓整個消失。
+  // 實測 highWater: NaN 送 3 MiB —— backpressureWaits 是 0、
+  // bufferedAmount 一路堆到 10,000,000，沒有任何錯誤，只是「看起來比較快」。
+  const ch = new FakeChannel();
+  assert.throws(() => createSender(ch, { highWater: NaN }), /highWater 必須是非負的有限數/);
+  assert.throws(() => createSender(ch, { lowWater: NaN }), /lowWater 必須是非負的有限數/);
+  assert.throws(() => createSender(ch, { highWater: Infinity }), /highWater 必須是非負的有限數/);
+  assert.throws(() => createSender(ch, { lowWater: -1 }), /lowWater 必須是非負的有限數/);
+  assert.throws(() => createSender(ch, { lowWater: 100, highWater: 100 }), /設反了/);
+  // 合法的一組仍然要能建起來，否則上面那些斷言可能只是「全部都丟錯」。
+  assert.equal(typeof createSender(ch, { lowWater: 1, highWater: 2 }).send, 'function');
+
+  // maxInFlight 同一個洞：NaN 會讓 `partials.size >= maxInFlight` 永遠是 false，
+  // 「送一百萬個 chunk 0」就真的能把記憶體堆爆。
+  assert.throws(() => createReceiver(() => {}, { maxInFlight: NaN }), /maxInFlight/);
+  assert.throws(() => createReceiver(() => {}, { maxInFlight: 0 }), /maxInFlight/);
+  assert.throws(() => createReceiver(() => {}, { maxInFlight: 1.5 }), /maxInFlight/);
+  assert.throws(() => createReceiver(() => {}, { maxInFlight: Infinity }), /maxInFlight/);
+  assert.equal(createReceiver(() => {}, { maxInFlight: 1 }).stats().maxInFlight, 1);
 });

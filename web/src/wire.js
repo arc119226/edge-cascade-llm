@@ -260,10 +260,17 @@ function planPayload(id, dModel, qLen, sBytes, outlierFrac) {
   return {
     scaleCount: nIn,
     outlierCount: nOut,
-    // 索引一律用 u16 表。wire_size.py:57 取 min(nOut*2, ceil(d/8))，也就是它允許
-    // 改用 bitmap；但 3% 的離群比例下 u16 表永遠勝出（3% < 1/16），所以 §4.5.4
-    // 只定義了 u16 這一種。若哪天 outlierFrac 調到 6.25% 以上，兩邊就會對不上，
-    // 而 test/wire.test.mjs 的位元組帳測試會立刻抓到 —— 那正是它存在的理由。
+    // 索引一律用 u16 表，因為 §4.5.4 只定義了這一種。
+    //
+    // 這裡原本寫著「wire_size.py 取 min(nOut*2, ceil(d/8)) 允許改用 bitmap，
+    // 但 3% 的離群比例下 u16 表永遠勝出，若哪天 outlierFrac 調到 6.25% 以上
+    // 兩邊才會對不上，而位元組帳測試會立刻抓到」。**那兩句都是假的**：
+    //   1. 真正生效的比例不是 outlierFrac，而是 `max(1, floor(d*frac)) / d` ——
+    //      那個 max(1) 讓小 d 的實際比例遠高於 3%，d < 34 時就已經超過 6.25%。
+    //      實測 d ∈ {1,2,4,8} 兩邊每則訊息就差 1 個位元組（16 種組合全中）。
+    //   2. 位元組帳測試當時只測 d ∈ {576, 5120, 100, 577}，永遠看不到這件事。
+    // 現在的結論是 wire_size.py 錯（規格沒定義 bitmap），它已改成無條件 nOut*2，
+    // 而位元組帳測試加上了 d ∈ {1,2,4,8}。要改成 bitmap 得先改 §4.5.4。
     bytes: nOut * 2 + nIn * sBytes + nOut * qLen * 2 + nIn * qLen,
   };
 }
@@ -299,8 +306,18 @@ export function encode(x, dModel, scheme, meta = {}) {
   const sBytes = SCALE_BYTES[precision];
   const outlierFrac = meta.outlierFrac ?? DEFAULT_OUTLIER_FRAC;
 
-  checkU16('dModel', dModel);
+  checkU32('dModel', dModel);
   if (dModel === 0) throw new Error('dModel 不能是 0');
+  // 方案 3 的離群索引區塊是 u16（§4.5.4），dModel 卻已經是 u32 —— 這個縫必須明講。
+  // 不擋的話 `setUint16` 會靜默地把 70000 寫成 4464，解碼端讀到一個合法但完全
+  // 不相干的 channel，張量只是「有點怪」。u32 的是 header 的計數欄位，不是索引表。
+  if (id === 3 && dModel > 0x10000) {
+    throw new Error(
+      `dModel ${dModel} 超過 65536，per-ch+outlier 送不上線：` +
+      '§4.5.4 的離群索引區塊是 u16，表示不了這麼大的 channel 索引。' +
+      '這種寬度（logits 回程）請改用 group-64 或 none',
+    );
+  }
   if (src.length % dModel !== 0) {
     throw new Error(
       `張量長度 ${src.length} 不是 dModel (${dModel}) 的整數倍 —— ` +
@@ -308,8 +325,22 @@ export function encode(x, dModel, scheme, meta = {}) {
     );
   }
   const qLen = src.length / dModel;
-  checkU16('qLen', qLen);
+  checkU32('qLen', qLen);
   if (qLen === 0) throw new Error('qLen 不能是 0：一則 frame 至少要帶一個 token 位置');
+
+  // §4.5.5b 的第三條：輸入含 Inf/NaN 一律丟回去，不要讓線路格式偷偷吞掉。
+  // 那是呼叫端的 bug（上一段的 softmax 炸了、KV 槽沒初始化…），而 NaN 沿著 hop
+  // 傳播正是這個專案最難查的失敗模式 —— 輸出看起來合理，只是慢慢偏掉。
+  // 掃這一遍不是額外成本：除了 scheme 0 以外的每個方案本來就要走一次 max|x|。
+  for (let i = 0; i < src.length; i++) {
+    if (!Number.isFinite(src[i])) {
+      throw new Error(
+        `輸入第 ${i} 個值是 ${src[i]}（t=${Math.floor(i / dModel)}, c=${i % dModel}），` +
+        'frame 不接受 Inf/NaN（§4.5.5b）。線路格式不會幫忙吞掉它 —— ' +
+        '請往上游找是誰產生的，NaN 傳過一個 hop 之後就只看得到「輸出壞掉」',
+      );
+    }
+  }
 
   const msgType = meta.msgType ?? 0;
   const roundId = meta.roundId ?? 0;
@@ -318,15 +349,14 @@ export function encode(x, dModel, scheme, meta = {}) {
   if (!Number.isInteger(msgType) || msgType < 0 || msgType > 255) {
     throw new Error(`msgType 必須是 0..255（0=激活值 1=logits 2=控制），收到 ${msgType}`);
   }
-  if (!Number.isInteger(stageIndex) || stageIndex < 0 || stageIndex > 255) {
-    throw new Error(`stageIndex 必須是 0..255，收到 ${stageIndex}`);
-  }
+  checkU16('stageIndex', stageIndex);
   checkU32('roundId', roundId);
   checkU32('startPosition', startPosition);
 
   const plan = planPayload(id, dModel, qLen, sBytes, outlierFrac);
-  checkU16('scaleCount', plan.scaleCount);
-  checkU16('outlierCount', plan.outlierCount);
+  checkU32('scaleCount', plan.scaleCount);
+  checkU32('outlierCount', plan.outlierCount);
+  checkU32('payloadLen', plan.bytes);
 
   const buf = new ArrayBuffer(frameHeaderSize + plan.bytes);
   const dv = new DataView(buf);
@@ -339,15 +369,14 @@ export function encode(x, dModel, scheme, meta = {}) {
   dv.setUint8(6, id);
   dv.setUint8(7, precision === 'fp16' ? 1 : 0);
   dv.setUint32(8, roundId, true);
-  dv.setUint8(12, stageIndex);
-  dv.setUint8(13, 0);
-  dv.setUint16(14, dModel, true);
-  dv.setUint16(16, qLen, true);
-  dv.setUint32(18, startPosition, true);
-  dv.setUint16(22, plan.scaleCount, true);
-  dv.setUint16(24, plan.outlierCount, true);
-  dv.setUint32(26, plan.bytes, true);
-  dv.setUint16(30, 0, true);
+  dv.setUint32(12, dModel, true);
+  dv.setUint32(16, qLen, true);
+  dv.setUint32(20, startPosition, true);
+  dv.setUint32(24, plan.scaleCount, true);
+  dv.setUint32(28, plan.outlierCount, true);
+  dv.setUint32(32, plan.bytes, true);
+  dv.setUint16(36, stageIndex, true);
+  dv.setUint16(38, 0, true);
 
   if (id === 0) encodeNone(dv, src, dModel, qLen);
   else if (id === 1) encodePerChannel(buf, dv, src, dModel, qLen, precision, sBytes);
@@ -497,6 +526,23 @@ export function peekHeader(buffer) {
     );
   }
   const flags = dv.getUint8(7);
+  // §4.5.2 把 flags 的 bit1..7 與位移 38 的 u16 都標成「保留，0」。
+  // 不驗的話，對方設了一個未來的 flag bit 我們會靜默當成沒設 ——
+  // 那是 §4.5.5b 規則 3 要防的同一種失敗：看起來解得出來，只是解錯了。
+  // 寧可在這裡明確拒絕，讓對方知道版本對不上。
+  if (flags & 0xfe) {
+    throw new Error(
+      `flags 的 bit1..7 是保留位元，§4.5.2 規定必須為 0，收到 0x${flags.toString(16)}。` +
+      '對方可能跑的是更新的格式，帶了這一版不認得的旗標 —— 不要猜它的意思。',
+    );
+  }
+  const reserved = dv.getUint16(38, true);
+  if (reserved !== 0) {
+    throw new Error(
+      `位移 38 的 u16 是保留欄位，§4.5.2 規定必須為 0，收到 ${reserved}。` +
+      '最可能的原因是 header 位移對不上（例如兩邊的 wire.js 版本不同），不要嘗試解。',
+    );
+  }
   return {
     magic,
     version,
@@ -506,13 +552,13 @@ export function peekHeader(buffer) {
     flags,
     scalePrecision: (flags & 1) ? 'fp16' : 'fp32',
     roundId: dv.getUint32(8, true),
-    stageIndex: dv.getUint8(12),
-    dModel: dv.getUint16(14, true),
-    qLen: dv.getUint16(16, true),
-    startPosition: dv.getUint32(18, true),
-    scaleCount: dv.getUint16(22, true),
-    outlierCount: dv.getUint16(24, true),
-    payloadLen: dv.getUint32(26, true),
+    dModel: dv.getUint32(12, true),
+    qLen: dv.getUint32(16, true),
+    startPosition: dv.getUint32(20, true),
+    scaleCount: dv.getUint32(24, true),
+    outlierCount: dv.getUint32(28, true),
+    payloadLen: dv.getUint32(32, true),
+    stageIndex: dv.getUint16(36, true),
   };
 }
 
@@ -541,12 +587,22 @@ export function decode(buffer) {
   const { dModel, qLen, schemeId } = h;
   // 拿 header 自己的欄位重算一次佈局。header 可能被截斷後補零、也可能是別的協定的
   // 位元組剛好撞上 magic；不驗的話後面的 Int8Array 視圖會越界或讀到垃圾。
-  const expect = expectedPayloadLen(h, sBytes);
-  if (expect !== h.payloadLen) {
+  const layout = describeLayout(h, sBytes);
+  const where =
+    `（scheme=${h.scheme}, dModel=${dModel}, qLen=${qLen}, ` +
+    `scaleCount=${h.scaleCount}, outlierCount=${h.outlierCount}, payloadLen=${h.payloadLen}）`;
+  if (layout.error) {
     throw new Error(
-      `payload 長度 ${h.payloadLen} 與 header 描述的佈局不符（應為 ${expect}）：` +
-      `scheme=${h.scheme}, dModel=${dModel}, qLen=${qLen}, ` +
-      `scaleCount=${h.scaleCount}, outlierCount=${h.outlierCount}。header 已經壞掉了，不要嘗試解`,
+      `header 自己描述的佈局就不成立，這則 frame 不能解：${layout.error}${where}。` +
+      '常見成因：兩端的 web/src/wire.js 不同版，或這段位元組根本不是 frame 開頭' +
+      '（chunk 子標頭沒剝掉、多則 frame 黏在一起）。header 已經壞掉了，不要嘗試解',
+    );
+  }
+  if (layout.bytes !== h.payloadLen) {
+    throw new Error(
+      `payload 長度 ${h.payloadLen} 與 header 描述的佈局不符：` +
+      `照 §4.5.4 用 header 自己的欄位算出來應該是 ${layout.bytes} 位元組${where}。` +
+      'header 已經壞掉了，不要嘗試解',
     );
   }
 
@@ -587,6 +643,19 @@ export function decode(buffer) {
       const c = dv.getUint16(frameHeaderSize + j * 2, true);
       if (c >= dModel) {
         throw new Error(`離群索引 ${c} 超出 dModel ${dModel} 的範圍，索引區塊已損壞`);
+      }
+      // 索引必須**互不相同**。只驗範圍是不夠的：把第 2 個 u16 改成跟第 1 個一樣，
+      // 每個 header 欄位都還自洽（nOut 沒變、scaleCount 仍等於 d-nOut、payloadLen 也對），
+      // 所以長度檢查與佈局檢查全部會過。但重複的索引會讓非離群 channel 的還原迴圈
+      // 少跳過一個 channel，之後每個 channel 的 int8 碼都錯位一格 ——
+      // 實測 d=576/K=4 有 2123/2304 個值是錯的、最大偏差 7.4e12，
+      // 再加上 Int8Array 讀到尾端外面產生的一個 NaN，而且完全不報錯。
+      if (isOutlier[c]) {
+        throw new Error(
+          `離群索引區塊有重複的索引 ${c}（第 ${j} 個），§4.5.4 規定它們必須互不相同。` +
+          '重複會讓非離群 channel 整個錯位，解出來的值看起來像雜訊但不會報錯 —— ' +
+          '不要放行。多半是送端的挑選邏輯壞了，或這段位元組被截斷後補過',
+        );
       }
       outIdx[j] = c;
       isOutlier[c] = 1;
@@ -640,21 +709,70 @@ function bodyView(dv, bodyOff, n) {
   return new Int8Array(dv.buffer, dv.byteOffset + bodyOff, n);
 }
 
-function expectedPayloadLen(h, sBytes) {
+/**
+ * 拿 header 自己的欄位重算一次 §4.5.4 的佈局。
+ *
+ * 回傳 `{ bytes }` 或 `{ error }`，**不再回傳 -1 當哨兵值**。
+ * 舊版回 -1，而 `decode()` 直接把它插進訊息裡：
+ * 「payload 長度 1024 與 header 描述的佈局不符（應為 -1）」。
+ * -1 不是一個長度，操作的人看到它只能來讀這支檔案才知道發生什麼事 ——
+ * 而真正的資訊（是哪個欄位對不上、正確值應該是多少）在這個函式裡明明算得出來。
+ */
+function describeLayout(h, sBytes) {
   const { dModel, qLen, schemeId, scaleCount, outlierCount } = h;
   const numel = dModel * qLen;
+  const noCounts = (scheme) => {
+    if (scaleCount !== 0) {
+      return `${scheme} 沒有 scale 區塊，scaleCount 必須是 0，header 卻寫 ${scaleCount}`;
+    }
+    if (outlierCount !== 0) {
+      return `${scheme} 沒有離群區塊，outlierCount 必須是 0，header 卻寫 ${outlierCount}`;
+    }
+    return null;
+  };
+
   if (schemeId === 0) {
-    return scaleCount === 0 && outlierCount === 0 ? 4 * numel : -1;
+    const bad = noCounts('none');
+    return bad ? { error: bad } : { bytes: 4 * numel };
   }
   if (schemeId === 1) {
-    return scaleCount === dModel && outlierCount === 0 ? dModel * sBytes + numel : -1;
+    if (scaleCount !== dModel) {
+      return {
+        error: `per-channel 每個 channel 一個 scale，scaleCount 必須等於 dModel ${dModel}，` +
+          `header 卻寫 ${scaleCount}`,
+      };
+    }
+    if (outlierCount !== 0) {
+      return { error: `per-channel 沒有離群區塊，outlierCount 必須是 0，header 卻寫 ${outlierCount}` };
+    }
+    return { bytes: dModel * sBytes + numel };
   }
   if (schemeId === 2) {
     const want = qLen * Math.ceil(dModel / GROUP);
-    return scaleCount === want && outlierCount === 0 ? want * sBytes + numel : -1;
+    if (scaleCount !== want) {
+      return {
+        error: `group-64 的 scale 數是 K × ceil(d/64) = ${qLen} × ${Math.ceil(dModel / GROUP)} = ` +
+          `${want}，header 的 scaleCount 卻寫 ${scaleCount}`,
+      };
+    }
+    if (outlierCount !== 0) {
+      return { error: `group-64 沒有離群區塊，outlierCount 必須是 0，header 卻寫 ${outlierCount}` };
+    }
+    return { bytes: want * sBytes + numel };
   }
+
   const nOut = outlierCount;
   const nIn = dModel - nOut;
-  if (nOut < 1 || nOut > dModel || scaleCount !== nIn) return -1;
-  return nOut * 2 + nIn * sBytes + nOut * qLen * 2 + nIn * qLen;
+  if (nOut < 1 || nOut > dModel) {
+    return {
+      error: `per-ch+outlier 的 outlierCount 必須落在 1..dModel（1..${dModel}），header 卻寫 ${nOut}`,
+    };
+  }
+  if (scaleCount !== nIn) {
+    return {
+      error: `per-ch+outlier 只有非離群 channel 需要 scale，scaleCount 必須等於 ` +
+        `dModel - outlierCount = ${dModel} - ${nOut} = ${nIn}，header 卻寫 ${scaleCount}`,
+    };
+  }
+  return { bytes: nOut * 2 + nIn * sBytes + nOut * qLen * 2 + nIn * qLen };
 }

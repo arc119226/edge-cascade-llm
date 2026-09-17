@@ -7,11 +7,18 @@
  * M1/M2 的教訓是「先確定算得對，再加網路」；把格式測試綁在瀏覽器上，
  * 之後查 WebRTC 的問題時就分不清是傳錯還是編錯了。
  *
- * 四件事在這裡被釘死：
+ * 七件事在這裡被釘死：
  *   1. fp16 編解碼的位元樣式（線路上兩端必須逐位元一致）
  *   2. round-trip 的位元組穩定性
  *   3. 與 M4 品質模擬器 `quant.js` 的數值綁定（§4.5.5，**不是無條件相等**）
  *   4. 位元組帳與 `bench/wire_size.py` 一致 —— 這一項才讓 §4.5 的表可信
+ *   5. §4.5.2 的**絕對位元組位移**（第 8 節）—— 跨實作解析唯一的依據
+ *   6. §4.5.5b 的飽和規則：有限的輸入不准變成 Inf/NaN，非有限的輸入不准被吞掉
+ *   7. 壞掉的 header 必須丟出說得出下一步的錯誤，而不是回傳垃圾
+ *
+ * 第 5 項是對抗性審查加上的，而且它的理由值得記著：在它之前，把 writer 與 reader
+ * 裡的欄位位移**同時**改掉，16 個測試全綠 —— 因為沒有任何一個測試站在「別家的
+ * 解析器」那一邊。encode 與 peekHeader 互相同意，不等於 frame 符合 §4.5.2。
  */
 
 import { test } from 'node:test';
@@ -121,7 +128,10 @@ function mirrorLayout(scheme, d, k, prec) {
   return {
     body: (d - nOut) * k + nOut * k * 2,
     scales: (d - nOut) * s,
-    index: Math.min(nOut * 2, Math.ceil(d / 8)),
+    // §4.5.4 只定義了 u16 索引表。這裡原本跟著 wire_size.py 寫
+    // `min(nOut*2, ceil(d/8))`（允許 bitmap），但那是 wire_size.py 錯 ——
+    // 見下面位元組帳測試裡 d ∈ {1,2,4,8} 的那段說明。
+    index: nOut * 2,
   };
 }
 
@@ -283,8 +293,14 @@ test('fp16 編碼：ties-to-even，正是 half-up 會做錯的那些', () => {
     [1 + 3 * 2 ** -11, 0x3c02, 0x3c02, '平手但偶數在上面：兩者同解'],
     [2049, 0x6800, 0x6801, '2048*(1+2^-11)'],
     [2051, 0x6802, 0x6802, '2048*(1+3*2^-11)'],
-    [65520, 0x7c00, null, '恰在 65504 與 65536 中間 -> 偶數 = 65536 = Inf'],
+    // 65520 恰在 65504 與 65536 中間，RTNE 會選偶數的 65536 —— fp16 表示不了。
+    // §4.5.5b 規定這裡飽和到最大有限值，不是 Inf：65520 是個有限的 fp32 值，
+    // 編成 Infinity 是靜默的數值毀損（方案 3 的離群本體就是走這條路）。
+    [65520, 0x7bff, null, '溢位邊界：飽和到 65504，不准變成 Inf'],
     [65519, 0x7bff, null, '差一點點，必須留在最大正規數'],
+    [1e5, 0x7bff, null, '遠超過 fp16 上限也是飽和'],
+    [-1e6, 0xfbff, null, '負的溢位飽和到 -65504，符號要留著'],
+    [3.4e38, 0x7bff, null, '接近 fp32 上限：仍然是有限值，仍然飽和'],
     [2 ** -25, 0x0000, null, '最小非正規數的一半 -> 平手進到偶數 0'],
     [2 ** -25 * 1.5, 0x0001, null, '超過一半 -> 1'],
     [2 ** -25 * 3, 0x0002, null, '非正規數區間也要 ties-to-even'],
@@ -593,7 +609,18 @@ test('fp16 scale：scale 本身相對誤差 < 2^-10，值的分歧不超過一�
 // ---------------------------------------------------------------------------
 
 test('位元組帳與 bench/wire_size.py 一致', (t) => {
-  const dims = [576, 5120, 100, 577];
+  /*
+   * ⚠ d ∈ {1, 2, 4, 8} 不是湊數的，它們是這一項唯一抓得到某個真實分歧的地方。
+   *
+   * 原本只測 {576, 5120, 100, 577}，而 wire_size.py 的 outlier_index_bytes()
+   * 取 `min(nOut*2, ceil(d/8))`（允許 bitmap），wire.js 則永遠寫 u16 索引表。
+   * 當時 wire.js 的註解寫著「要 outlierFrac 調到 6.25% 以上兩邊才會對不上，
+   * 而位元組帳測試會立刻抓到」—— 兩句都是假的：真正生效的比例是
+   * `max(1, floor(d*frac))/d`，d < 34 時就已經超過 6.25%，而這裡的維度全都 ≥ 100，
+   * 所以測試永遠看不到。實測 d ∈ {1,2,4,8} × K ∈ {1,8} × 兩種精度共 16 種組合
+   * 每則訊息差 1 個位元組。§4.5.4 只定義 u16 表，所以錯的是 wire_size.py。
+   */
+  const dims = [576, 5120, 100, 577, 1, 2, 4, 8];
   const lens = [1, 8, 16, 32];
   const precs = ['fp16', 'fp32'];
   const combos = [];
@@ -771,7 +798,7 @@ test('header：每個欄位都要活著走完 encode -> peekHeader', () => {
   const meta = {
     msgType: 1,            // logits 回程（§4.5.7 現在就要佔位）
     roundId: 4294967295,   // u32 上限
-    stageIndex: 255,       // u8 上限
+    stageIndex: 65535,     // u16 上限（§4.5.2 改版後它在位移 36，不再是 u8）
     startPosition: 123456, // M3 恆為 0，但欄位現在就要能帶（§4.5.3）
     scalePrecision: 'fp32',
   };
@@ -799,7 +826,7 @@ test('header：每個欄位都要活著走完 encode -> peekHeader', () => {
   assert.deepEqual(r.meta, {
     msgType: 1,
     roundId: 4294967295,
-    stageIndex: 255,
+    stageIndex: 65535,
     startPosition: 123456,
     scalePrecision: 'fp32',
   });
@@ -815,8 +842,7 @@ test('header：每個欄位都要活著走完 encode -> peekHeader', () => {
 
   // 保留欄位必須是 0，否則之後拿它們擴充時會讀到舊節點留下的垃圾
   const dv = new DataView(buf);
-  assert.equal(dv.getUint8(13), 0, 'offset 13 是保留欄位');
-  assert.equal(dv.getUint16(30, true), 0, 'offset 30 是保留欄位');
+  assert.equal(dv.getUint16(38, true), 0, 'offset 38 是保留欄位（§4.5.2 的最後兩個位元組）');
 
   // 四個 schemeId 都要能往返
   for (const name of SCHEME_NAMES) {
@@ -875,18 +901,18 @@ test('拒絕：壞掉的 frame 必須丟出可行動的錯誤，不能回傳垃�
   assert.throws(() => decode(new ArrayBuffer(0)), /header|太短/);
 
   // payloadLen 與 buffer 長度不符（header 說得比實際多 / 少）
-  assert.throws(() => decode(corrupt((dv) => dv.setUint32(26, 999999, true))), /長度不符/);
-  assert.throws(() => decode(corrupt((dv) => dv.setUint32(26, 4, true))), /長度不符/);
+  assert.throws(() => decode(corrupt((dv) => dv.setUint32(32, 999999, true))), /長度不符/);
+  assert.throws(() => decode(corrupt((dv) => dv.setUint32(32, 4, true))), /長度不符/);
 
   // payloadLen 對得上 buffer，但與 header 描述的佈局不符 —— 這是最陰險的一種，
   // 因為長度檢查會過，接著 Int8Array 視圖就越界或讀到別的區塊
   assert.throws(
-    () => decode(corrupt((dv) => dv.setUint16(22, 1, true))),
+    () => decode(corrupt((dv) => dv.setUint32(24, 1, true))),
     /佈局/,
     'scaleCount 與 dModel 對不上時必須丟錯',
   );
   assert.throws(
-    () => decode(corrupt((dv) => dv.setUint16(14, dModel + 1, true))),
+    () => decode(corrupt((dv) => dv.setUint32(12, dModel + 1, true))),
     /佈局/,
   );
 
@@ -903,8 +929,19 @@ test('拒絕：壞掉的 frame 必須丟出可行動的錯誤，不能回傳垃�
   assert.throws(() => encode(new Float32Array(10), 3, 'none'), /整數倍/);
   assert.throws(() => encode(new Float32Array(10), 5, 'nope'), /未知的量化方案/);
   assert.throws(() => encode(new Float32Array(10), 5, 'none', { scalePrecision: 'fp8' }), /scalePrecision/);
-  assert.throws(() => encode(new Float32Array(10), 70000, 'none'), /dModel/);
-  assert.throws(() => encode(new Float32Array(10), 5, 'none', { stageIndex: 256 }), /stageIndex/);
+  // dModel 現在是 u32（§4.5.2），70000 是合法的 —— Llama 3 的 vocab 是 128256，
+  // 回程 logits 本來就會用到這種寬度。擋的是超過 u32 與非整數。
+  assert.equal(peekHeader(encode(new Float32Array(70000), 70000, 'per-channel')).dModel, 70000);
+  assert.throws(() => encode(new Float32Array(10), 2 ** 32, 'none'), /dModel/);
+  assert.throws(() => encode(new Float32Array(10), 5.5, 'none'), /dModel/);
+  // 但方案 3 的離群索引區塊仍然是 u16（§4.5.4），所以它有自己的上限。
+  // 不擋的話 setUint16 會把 70000 靜默地寫成 4464。
+  assert.throws(
+    () => encode(new Float32Array(70000), 70000, 'per-ch+outlier'),
+    /離群索引|u16/,
+    'dModel 超過 65536 時 per-ch+outlier 必須明確拒絕，不能靜默截斷索引',
+  );
+  assert.throws(() => encode(new Float32Array(10), 5, 'none', { stageIndex: 65536 }), /stageIndex/);
   assert.throws(() => encode(new Float32Array(10), 5, 'none', { roundId: -1 }), /roundId/);
   assert.throws(() => decode('不是 buffer'), /ArrayBuffer/);
 });
@@ -922,4 +959,423 @@ test('decode 接受大 buffer 中間的切片（dcframe.js 重組不想再複製
   // 早期版本這裡用 `new Int8Array(dv.buffer, bodyOff, n)` 忽略了 byteOffset，
   // 結果 int8 本體整個位移，解出來的張量「只是有點怪」而且不會報錯。
   assertExact(decode(view).data, decode(frame).data, '切片輸入解出來的值不同');
+});
+
+// ---------------------------------------------------------------------------
+// 8. §4.5.2 的絕對位移 —— 跨實作解析的唯一依據
+// ---------------------------------------------------------------------------
+
+test('header：每個欄位都釘在 §4.5.2 表上的那個位元組', () => {
+  /*
+   * ⚠ 這一項與上面那個「往返」測試**不能互相取代**，而且它才是重點。
+   *
+   * 往返測試只證明 `encode` 與 `peekHeader` 彼此同意 —— 把 writer 與 reader 裡的
+   * dModel 與 qLen 兩個位移**同時**對調，整份測試仍然全綠，而送出去的 frame
+   * 沒有任何別的實作解得開。§4.5.2 存在的理由就是跨實作解析，所以至少要有一個
+   * 測試站在「別人家的解析器」那一邊：只認表上的數字。
+   *
+   * 因此下面的位移全部是手寫的字面常數，**不准**從 wire.js 匯入任何東西來算
+   * （連 frameHeaderSize 都不用）—— 那樣測試只會跟著 bug 一起搬家。
+   * 每個欄位給一個彼此不同的哨兵值，任何兩個欄位互換都會紅。
+   */
+  const dModel = 300;   // nOut = floor(300 * 0.03) = 9，nIn = 291
+  const qLen = 7;
+  const x = makeTensor(dModel, qLen, 31337);
+  const buf = encode(x, dModel, 'per-ch+outlier', {
+    msgType: 2,              // 2 = 控制（§4.5.2），與 version 1 / schemeId 3 都不同
+    roundId: 0xa1b2c3d4,     // 2712847316：四個位元組各不相同，順序錯了一定看得出來
+    startPosition: 0x11223344, // 287454020
+    stageIndex: 0x0102,      // 258：超過 u8，證明它真的是 u16 而且不在位移 12
+    scalePrecision: 'fp16',  // flags bit0 = 1
+  });
+  const dv = new DataView(buf);
+
+  // payloadLen 照 §4.5.4 手算：索引 9×2 + scale 291×2 + fp16 離群 9×7×2 + int8 291×7
+  const payloadLen = 9 * 2 + 291 * 2 + 9 * 7 * 2 + 291 * 7; // = 2763
+  assert.equal(buf.byteLength, 40 + payloadLen, 'header 是 40 位元組（§4.5.2），payload 照 §4.5.4');
+  assert.equal(frameHeaderSize, 40, 'frameHeaderSize 必須等於 §4.5.2 的 40');
+
+  //         位移  大小  欄位
+  assert.equal(dv.getUint32(0, true), 0x314c4345, '位移 0 u32 magic');
+  assert.equal(dv.getUint8(4), 1, '位移 4 u8 version');
+  assert.equal(dv.getUint8(5), 2, '位移 5 u8 msgType');
+  assert.equal(dv.getUint8(6), 3, '位移 6 u8 schemeId（per-ch+outlier）');
+  assert.equal(dv.getUint8(7), 1, '位移 7 u8 flags（bit0 = scale 用 fp16）');
+  assert.equal(dv.getUint32(8, true), 0xa1b2c3d4, '位移 8 u32 roundId');
+  assert.equal(dv.getUint32(12, true), 300, '位移 12 u32 dModel');
+  assert.equal(dv.getUint32(16, true), 7, '位移 16 u32 qLen');
+  assert.equal(dv.getUint32(20, true), 0x11223344, '位移 20 u32 startPosition');
+  assert.equal(dv.getUint32(24, true), 291, '位移 24 u32 scaleCount（= dModel - outlierCount）');
+  assert.equal(dv.getUint32(28, true), 9, '位移 28 u32 outlierCount');
+  assert.equal(dv.getUint32(32, true), payloadLen, '位移 32 u32 payloadLen');
+  assert.equal(dv.getUint16(36, true), 258, '位移 36 u16 stageIndex');
+  assert.equal(dv.getUint16(38, true), 0, '位移 38 u16 保留，必須是 0');
+
+  // 逐位元組確認 little-endian（§4.5.2 寫死，不跟平台走）。
+  assert.deepEqual(
+    Array.from(new Uint8Array(buf, 0, 4)), [0x45, 0x43, 0x4c, 0x31],
+    "magic 的四個位元組應該是 'E' 'C' 'L' '1'",
+  );
+  assert.deepEqual(
+    Array.from(new Uint8Array(buf, 8, 4)), [0xd4, 0xc3, 0xb2, 0xa1],
+    'roundId 必須是 little-endian',
+  );
+  assert.deepEqual(
+    Array.from(new Uint8Array(buf, 36, 2)), [0x02, 0x01],
+    'stageIndex 必須是 little-endian 的 u16',
+  );
+
+  // version 與 flags 在上面剛好都是 1，單靠那個 frame 分不出兩者有沒有互換。
+  // 再編一個 fp32 的：flags 變 0、version 仍然是 1。
+  const fp32 = new DataView(encode(x, dModel, 'per-ch+outlier', { scalePrecision: 'fp32' }));
+  assert.equal(fp32.getUint8(4), 1, '位移 4 是 version，不會跟著 scalePrecision 變');
+  assert.equal(fp32.getUint8(7), 0, '位移 7 是 flags，fp32 時 bit0 = 0');
+
+  /*
+   * 寬度也要釘：上面的值全都塞得進 u16，所以光靠它們分不出 u32 與 u16。
+   * 這兩個維度正是 §4.5.2 從 32 位元組改成 40 位元組的理由 ——
+   * Llama 3 的 vocab 是 128256、Qwen 2.5 是 151936，u16 的 dModel 表示不了
+   * §4.5.7 規定要送的 logits。
+   */
+  const wide = new DataView(encode(new Float32Array(128256), 128256, 'per-channel'));
+  assert.equal(wide.getUint32(12, true), 128256, '位移 12 的 dModel 必須是 u32（Llama 3 的 vocab）');
+  assert.equal(wide.getUint32(24, true), 128256, '位移 24 的 scaleCount 必須是 u32');
+
+  const longSeq = new DataView(encode(new Float32Array(70000), 1, 'none'));
+  assert.equal(longSeq.getUint32(16, true), 70000, '位移 16 的 qLen 必須是 u32');
+  assert.equal(longSeq.getUint32(32, true), 280000, '位移 32 的 payloadLen 必須是 u32');
+});
+
+// ---------------------------------------------------------------------------
+// 9. §4.5.5b 飽和規則：有限的輸入不准變成 Inf 或 NaN
+// ---------------------------------------------------------------------------
+
+test('§4.5.5b：fp16 離群本體溢位要飽和到 65504，不准解出 Infinity', () => {
+  /*
+   * 對抗性審查的原始重現：d=576、K=4、x[137] = 65520，其餘 O(3)。
+   * `encode(x, 576, 'per-ch+outlier')` 解回來 `data[137] === Infinity`，兩端都不報錯。
+   * 65520 落在 65504 與 65536 正中間，RTNE 進位到 65536 = fp16 的 Inf。
+   *
+   * 諷刺的地方要寫下來：方案 3 的離群路徑是 §4.2 專門為了「保住巨值」才加的，
+   * 而它是四個方案裡唯一會把巨值變成 Infinity 的。同一個值走 int8 路徑毫無問題 ——
+   * 下面的 per-channel 對照組就是為了證明這件事。
+   */
+  const dModel = 576;
+  const qLen = 4;
+  const hot = 137; // t=0 的 channel 137，magnitude 最大所以一定被挑成離群
+
+  for (const huge of [65520, 1e5, 1e6]) {
+    // 離群本體固定 fp16，與 flags bit0 無關 —— 兩種 scalePrecision 都要驗。
+    for (const prec of ['fp16', 'fp32']) {
+      const x = makeTensor(dModel, qLen, 808);
+      for (let i = 0; i < x.length; i++) x[i] = (i % dModel) === hot ? 0 : 3;
+      x[hot] = huge;
+      const tag = `x=${huge} ${prec}`;
+
+      const buf = encode(x, dModel, 'per-ch+outlier', { scalePrecision: prec });
+      assert.ok(readOutlierIndex(buf).includes(hot), `${tag}：巨值的 channel 沒被挑成離群`);
+      const got = decode(buf).data;
+
+      assert.ok(
+        Number.isFinite(got[hot]),
+        `${tag}：離群 channel 解出 ${got[hot]} —— 有限的輸入不准變成 Inf（§4.5.5b）`,
+      );
+      assert.equal(got[hot], 65504, `${tag}：應該飽和到 fp16 的最大有限值 65504`);
+      for (let i = 0; i < got.length; i++) {
+        assert.ok(Number.isFinite(got[i]), `${tag}：第 ${i} 個值是 ${got[i]}`);
+      }
+    }
+  }
+
+  // 對照組：同一個 1e5 走 per-channel（int8 路徑）從來都沒壞過。
+  // 這就是為什麼不能把這個 bug 說成「fp16 本來就表示不了 1e5」——
+  // 表示不了是真的，解出 Infinity 不是必然的。
+  const ctrl = new Float32Array(dModel * qLen).fill(3);
+  ctrl[hot] = 1e5;
+  const gotCtrl = decode(encode(ctrl, dModel, 'per-channel')).data;
+  assert.ok(Number.isFinite(gotCtrl[hot]), `per-channel 對照組解出 ${gotCtrl[hot]}`);
+  assert.ok(
+    Math.abs(gotCtrl[hot] - 1e5) / 1e5 < 0.01,
+    `per-channel 對照組應該還原成 1e5 量級，得到 ${gotCtrl[hot]}`,
+  );
+});
+
+test('§4.5.5b：fp16 scale 溢位要飽和，不准整個 channel / 整組解出 NaN', () => {
+  /*
+   * 第二條靜默路徑，比上面那條更惡劣：壞掉的不是那一個值，是整個 channel。
+   *
+   * 重現：d=2、K=2、x = [8.4e6, 1.5, ...]，預設 fp16 scale。
+   * scale = max|x| / 127 = 66141 > 65504，捨入成 fp16 的 Inf；
+   * 量化時 `x / Inf` = 0，所有 int8 碼變 0；解碼端算 `0 × Inf` = **NaN**。
+   * 門檻剛好是 127 × 65520 = 8321040（8321039 還活著）。
+   *
+   * 舊版的 knownGap 寫著「Inf 會被 clamp 夾成 ±127」—— 實測是錯的：
+   * Inf 與巨大的有限值根本走不到 clamp，它們是先被 scale 除成 0、
+   * 再在解碼端乘回 Inf 變 NaN 的。NaN 沿著 hop 傳播是這個專案最難查的失敗模式。
+   */
+  const NAN_THRESHOLD = 127 * 65520; // 8321040：舊實作從這個值開始整個 channel 變 NaN
+
+  {
+    const x = Float32Array.from([8.4e6, 1.5, 2.5, 0.5]); // d=2, K=2
+    const got = decode(encode(x, 2, 'per-channel')).data; // 預設就是 fp16 scale
+    for (let i = 0; i < got.length; i++) {
+      assert.ok(!Number.isNaN(got[i]), `d=2 K=2：第 ${i} 個值是 NaN —— scale 溢位成 Inf 了`);
+      assert.ok(Number.isFinite(got[i]), `d=2 K=2：第 ${i} 個值是 ${got[i]}`);
+    }
+    // 飽和之後最大可表示值是 127 × 65504；超過的部分損失大小但保持有限（§4.5.5b）。
+    assert.equal(got[0], 127 * 65504, '8.4e6 應該夾在 127 × 65504 = 8319008');
+  }
+
+  // 恰好在舊門檻上，以及剛好可表示的上限：兩個值都必須有限，而且上限要精確往返。
+  for (const m of [NAN_THRESHOLD - 1, NAN_THRESHOLD, 127 * 65504]) {
+    const x = Float32Array.from([m, 1.5]);
+    const got = decode(encode(x, 2, 'per-channel')).data;
+    assert.ok(Number.isFinite(got[0]), `max|x| = ${m}：解出 ${got[0]}`);
+  }
+  {
+    // scale 剛好是 65504 時沒有任何損失，這是 §4.5.5b 說的「最大可表示值」。
+    const x = Float32Array.from([127 * 65504, 1.5]);
+    assert.equal(decode(encode(x, 2, 'per-channel')).data[0], 127 * 65504);
+  }
+
+  // 一個值毒死一整組：per-channel 壞 K 個、group-64 壞整組 64 個 channel。
+  for (const scheme of ['per-channel', 'group-64', 'per-ch+outlier']) {
+    const dModel = 128;
+    const qLen = 4;
+    const x = new Float32Array(dModel * qLen).fill(2);
+    x[5] = 9e6;
+    const got = decode(encode(x, dModel, scheme)).data; // fp16 scale
+    let nan = 0;
+    for (let i = 0; i < got.length; i++) if (Number.isNaN(got[i])) nan++;
+    assert.equal(
+      nan, 0,
+      `${scheme} d=128 K=4：x[5]=9e6 讓 ${nan} 個值變成 NaN —— ` +
+      '一個值不該毒死整個 channel 或整組 64 個 channel',
+    );
+  }
+});
+
+test('§4.5.5b：encode() 對 Inf / NaN 的輸入直接丟錯，不偷偷吞掉', () => {
+  /*
+   * 前兩項講的是「有限的輸入不准變成 Inf/NaN」。這一項是反方向：
+   * 輸入本身就有 Inf/NaN 時，線路格式**不負責**把它變得好看。
+   * 那是呼叫端的 bug（上一段的 softmax 炸了、KV 槽沒初始化…），
+   * 而且無聲吞掉的代價極高 —— 下游只會看到「輸出看起來合理、只是慢慢偏掉」。
+   * 掃這一遍的成本是零：除了 scheme 0 以外每個方案本來就要走一次 max|x|。
+   */
+  const dModel = 64;
+  const qLen = 2;
+  for (const scheme of SCHEME_NAMES) {
+    for (const bad of [Infinity, -Infinity, NaN]) {
+      const x = new Float32Array(dModel * qLen).fill(1.5);
+      x[dModel + 7] = bad; // t=1, c=7
+      assert.throws(
+        () => encode(x, dModel, scheme),
+        (err) => {
+          assert.match(err.message, /Inf|NaN/, `${scheme}：錯誤訊息要說出是 Inf 還是 NaN`);
+          assert.match(err.message, /71/, `${scheme}：錯誤訊息要說出是第幾個值（71）`);
+          assert.match(err.message, /[一-鿿]/, `${scheme}：錯誤訊息必須是中文`);
+          return true;
+        },
+        `${scheme}：輸入含 ${bad} 時 encode 必須丟錯（§4.5.5b）`,
+      );
+    }
+    // 同一份資料把壞值拿掉就必須編得出來 —— 證明擋的是壞值，不是別的東西
+    assert.ok(encode(new Float32Array(dModel * qLen).fill(1.5), dModel, scheme).byteLength > 0);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 10. 重複的離群索引
+// ---------------------------------------------------------------------------
+
+test('拒絕：離群索引重複 —— 每個 header 欄位都自洽，值卻整個錯位', () => {
+  /*
+   * 這是「header 檢查全過、資料照樣爛掉」最乾淨的例子：
+   * decode 驗了每個索引 < dModel，也驗了 scaleCount === dModel - outlierCount，
+   * 就是沒驗索引互不相同。把第 2 個 u16 改成跟第 1 個一樣，長度、scaleCount、
+   * outlierCount、payloadLen 全都沒動，所有既有檢查都會放行。
+   *
+   * 後果：非離群 channel 的還原迴圈少跳過一個 channel，之後每個 channel 的
+   * int8 碼都錯位一格。實測 d=576/K=4 有 2123/2304 個值是錯的、最大偏差 7.4e12，
+   * 外加 Int8Array 讀到尾端外面產生的一個 NaN —— 而且完全不報錯。
+   */
+  const dModel = 576;
+  const qLen = 4;
+  const x = makeTensor(dModel, qLen, 4242);
+  const good = encode(x, dModel, 'per-ch+outlier', { scalePrecision: 'fp32' });
+  const h = peekHeader(good);
+
+  const copy = good.slice(0);
+  const dv = new DataView(copy);
+  const first = dv.getUint16(frameHeaderSize, true);
+  dv.setUint16(frameHeaderSize + 2, first, true); // 第 2 個索引 = 第 1 個
+
+  // 先證明「每個 header 欄位都還自洽」，不然這個測試只是在測一個顯然壞掉的 frame
+  const hc = peekHeader(copy);
+  assert.equal(copy.byteLength, good.byteLength, '長度沒變');
+  assert.equal(hc.outlierCount, h.outlierCount, 'outlierCount 沒變');
+  assert.equal(hc.scaleCount, dModel - hc.outlierCount, 'scaleCount 仍然自洽');
+  assert.equal(hc.payloadLen, copy.byteLength - frameHeaderSize, 'payloadLen 仍然自洽');
+
+  assert.throws(
+    () => decode(copy),
+    (err) => {
+      assert.match(err.message, /重複/, '錯誤訊息要說出是「重複」');
+      assert.match(err.message, new RegExp(String(first)), '錯誤訊息要說出是哪個索引');
+      return true;
+    },
+    '重複的離群索引必須丟錯 —— 放行的話 2123/2304 個值是錯的而且沒人會發現',
+  );
+
+  // 只有重複要擋，合法的索引集合不能被誤傷
+  assert.doesNotThrow(() => decode(good));
+});
+
+// ---------------------------------------------------------------------------
+// 11. 錯誤訊息要能操作
+// ---------------------------------------------------------------------------
+
+test('錯誤訊息：佈局不符時說出是哪個欄位，不准出現 -1 這種哨兵值', () => {
+  /*
+   * 舊版 `expectedPayloadLen()` 用 -1 當「header 自相矛盾」的哨兵值，
+   * 而 decode 直接把它插進訊息裡：
+   *   「payload 長度 1024 與 header 描述的佈局不符（應為 -1）」
+   * -1 不是一個長度。看到它的人只能來讀 wire.js 才知道發生了什麼事 ——
+   * 而「是哪個欄位對不上、正確值是多少」在那個函式裡明明算得出來。
+   */
+  const dModel = 128;
+  const qLen = 4;
+  const x = makeTensor(dModel, qLen, 606);
+
+  const bend = (scheme, mutate) => {
+    const buf = encode(x, dModel, scheme, { scalePrecision: 'fp32' }).slice(0);
+    mutate(new DataView(buf));
+    try {
+      decode(buf);
+    } catch (err) {
+      return err.message;
+    }
+    return assert.fail(`${scheme}：改壞的 header 必須丟錯`);
+  };
+
+  const cases = [
+    // [說明, 方案, 改哪裡, 訊息裡必須出現的字]
+    ['per-channel 的 scaleCount 不等於 dModel', 'per-channel',
+      (dv) => dv.setUint32(24, 1, true), [/scaleCount/, /dModel/, /128/]],
+    ['per-channel 卻帶了 outlierCount', 'per-channel',
+      (dv) => dv.setUint32(28, 3, true), [/outlierCount/]],
+    ['group-64 的 scaleCount 不是 K × ceil(d/64)', 'group-64',
+      (dv) => dv.setUint32(24, 5, true), [/scaleCount/, /group-64/, /8/]],
+    ['none 不該有 scale 區塊', 'none',
+      (dv) => dv.setUint32(24, 2, true), [/scaleCount/]],
+    ['per-ch+outlier 的 outlierCount 是 0', 'per-ch+outlier',
+      (dv) => dv.setUint32(28, 0, true), [/outlierCount/]],
+    ['per-ch+outlier 的 scaleCount 對不上 d - nOut', 'per-ch+outlier',
+      (dv) => dv.setUint32(24, 7, true), [/scaleCount/, /outlierCount/]],
+  ];
+
+  for (const [label, scheme, mutate, wants] of cases) {
+    const msg = bend(scheme, mutate);
+    assert.ok(!msg.includes('-1'), `${label}：訊息裡不准出現 -1 哨兵值 —— 「${msg}」`);
+    assert.match(msg, /[一-鿿]/, `${label}：錯誤訊息必須是中文`);
+    assert.match(msg, /佈局/, `${label}：訊息要指出是佈局的問題`);
+    for (const want of wants) {
+      assert.match(msg, want, `${label}：訊息要說出對不上的是哪個欄位 —— 「${msg}」`);
+    }
+    // 只說「壞了」不夠，要說下一步：不要解，並指出最可能的成因
+    assert.match(msg, /不要嘗試解/, `${label}：訊息要說出下一步怎麼做`);
+  }
+
+  // 佈局本身成立、只是 payloadLen 被改小的那條路徑，訊息要給得出真正的長度
+  const truncated = encode(x, dModel, 'per-channel', { scalePrecision: 'fp32' }).slice(0);
+  new DataView(truncated).setUint32(32, 8, true);
+  assert.throws(() => decode(truncated), (err) => {
+    assert.ok(!err.message.includes('-1'), `不准出現 -1：「${err.message}」`);
+    assert.match(err.message, /長度不符/);
+    return true;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 以下四個測試補的是 mutation testing 找到的漏洞：這四個 mutation 在 38 個
+// 測試全綠的情況下存活下來。它們共通的形狀都是「encode 與 decode 彼此同意，
+// 但兩邊一起違反規格」—— 和第 17 號測試（header 絕對位移）要防的是同一類，
+// 只是當時只釘了 header，沒釘 payload 區塊。
+
+test('decode：payloadLen 與佈局對不上時要丟錯（這條分支先前完全沒被測到）', () => {
+  // mutation：把 `if (layout.bytes !== h.payloadLen)` 改成 `if (false)`，
+  // 38 個測試依然全綠 —— 而這是整支檔案最吃重的一道防線。
+  //
+  // 重現方式：一則合法的 per-channel frame，只改 qLen（u32@16）4 -> 3。
+  // scaleCount 仍等於 dModel、payloadLen 仍等於真正的位元組數，
+  // 所以前面每一道檢查都過；停掉這條分支的話 decode() 會安靜地回傳
+  // 384 個值而不是 512 個，而且不報錯。
+  const dModel = 128;
+  const buf = encode(makeTensor(dModel, 4, 7), dModel, 'per-channel', { scalePrecision: 'fp32' });
+  const dv = new DataView(buf);
+  assert.equal(dv.getUint32(16, true), 4, '前提：qLen 在位移 16');
+  dv.setUint32(16, 3, true);
+
+  assert.throws(() => decode(buf), (err) => {
+    assert.match(err.message, /佈局不符/);
+    // 順便釘住 E 的修正：這條分支也不准出現 -1 哨兵值。
+    // 先前只有 layout.error 那條分支被測到，所以把 -1 塞回這裡也能存活。
+    assert.ok(!err.message.includes('-1'), `不准出現 -1：「${err.message}」`);
+    assert.match(err.message, /\d+ 位元組/, '要說出正確的位元組數是多少');
+    return true;
+  });
+});
+
+test('scheme 0 的 fp32 本體是 little-endian（§4.5.7 回程走的就是這條）', () => {
+  // mutation：把 encodeNone 的 setFloat32 與 decode 的 getFloat32 一起翻成
+  // big-endian，38 個測試全綠 —— 因為本體只被往返測試驗過，encoder 與
+  // decoder 可以彼此同意卻一起違反規格。
+  //
+  // 這一條特別要緊：scheme 0 是 §4.5.7 的 logits 回程，是最可能被另一個
+  // 實作讀到的訊息。
+  const buf = encode(Float32Array.from([1.5, -2.0]), 2, 'none', {});
+  const u8 = new Uint8Array(buf, frameHeaderSize);
+  // 1.5 的 fp32 是 0x3FC00000，little-endian 就是 00 00 C0 3F
+  assert.deepEqual(Array.from(u8.slice(0, 4)), [0x00, 0x00, 0xc0, 0x3f], '1.5 必須是 00 00 C0 3F');
+  // -2.0 是 0xC0000000 -> 00 00 00 C0
+  assert.deepEqual(Array.from(u8.slice(4, 8)), [0x00, 0x00, 0x00, 0xc0], '-2.0 必須是 00 00 00 C0');
+});
+
+test('scheme 3 的 fp16 離群本體是 little-endian', () => {
+  // 同一類 mutation：fp16 scale 區塊、fp32 scale 區塊、離群索引區塊都已經
+  // 被現有測試殺掉了，唯獨離群「本體」沒有任何絕對位元組斷言。
+  //
+  // d=4 時 nOut = max(1, floor(4 * 0.03)) = 1，所以 channel 0（最大值）是離群。
+  // 佈局（§4.5.4，fp16 scale）：
+  //   40  索引    1 x u16 = 2
+  //   42  scale   3 x 2   = 6
+  //   48  fp16 本體 1 x 1 x 2 = 2   <- 要驗的就是這兩個位元組
+  //   50  int8 本體 3 x 1 = 3
+  const buf = encode(Float32Array.from([1000, 1, 2, 3]), 4, 'per-ch+outlier', { scalePrecision: 'fp16' });
+  const dv = new DataView(buf);
+  assert.equal(dv.getUint32(28, true), 1, '前提：outlierCount = 1');
+  assert.equal(dv.getUint16(frameHeaderSize, true), 0, '前提：離群的是 channel 0');
+
+  const u8 = new Uint8Array(buf, frameHeaderSize + 2 + 3 * 2, 2);
+  // 1000 = 1.953125 x 2^9 -> e=24, mantissa=976 -> 0x63D0 -> LE 是 D0 63
+  assert.equal(floatToFp16(1000), 0x63d0, '前提：fp16(1000) = 0x63D0');
+  assert.deepEqual(Array.from(u8), [0xd0, 0x63], 'fp16 離群本體必須是 little-endian');
+});
+
+test('§4.5.2 的保留位元必須是 0，不准靜默接受', () => {
+  const buf = encode(makeTensor(64, 2, 11), 64, 'group-64', {});
+
+  const withFlag = buf.slice(0);
+  const dv1 = new DataView(withFlag);
+  dv1.setUint8(7, dv1.getUint8(7) | 0x02); // 設一個「未來的」flag bit
+  assert.throws(() => decode(withFlag), /保留位元|保留/, 'flags bit1..7 不是 0 就該拒絕');
+
+  const withReserved = buf.slice(0);
+  const dv2 = new DataView(withReserved);
+  dv2.setUint16(38, 0xbeef, true);
+  assert.throws(() => decode(withReserved), /保留欄位|位移 38/, '位移 38 不是 0 就該拒絕');
+
+  // 對照組：原本那一則仍然解得開，證明上面兩個拒絕不是誤殺
+  assert.equal(decode(buf).qLen, 2);
 });

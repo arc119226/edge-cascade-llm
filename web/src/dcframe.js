@@ -54,6 +54,22 @@ const HIGH_WATER = 524288;
 const MAX_IN_FLIGHT = 8;
 
 /**
+ * 記住「最近完成的 messageId」幾則，用來擋重播。
+ *
+ * 沒有這張表的時候，重複偵測只蓋得到**重組中**的訊息：一旦最後一塊到了、
+ * entry 被 delete，同一則訊息再餵一次就變成全新的訊息。實測
+ * `handle(mk(1,0,1)); handle(mk(1,0,1));` 會讓 onMessage **觸發兩次**、
+ * 完全不報錯 —— 下游把同一個 frame 算兩遍，而模組自己的錯誤訊息卻說
+ * 「DataChannel 是 reliable + ordered，不該出現重送」。多 chunk 的版本更糟：
+ * 重播 chunk 0 會開一個永遠補不滿的新 entry，白佔一個 in-flight 名額到 channel 重建為止。
+ *
+ * 刻意是**有界**的環狀緩衝：記住全部 messageId 才是真的無上限成長（那正是
+ * maxInFlight 在防的事）。代價是超過 64 則之前的重播抓不到 —— 這一層要抓的是
+ * 程式錯誤與壞掉的對端，不是惡意重放；真正的防重放要序號窗口 + 認證（M6）。
+ */
+const COMPLETED_MEMORY = 64;
+
+/**
  * 建立分塊送出端。
  *
  * @param {RTCDataChannel|object} channel 只用到 send / bufferedAmount /
@@ -63,6 +79,20 @@ const MAX_IN_FLIGHT = 8;
 export function createSender(channel, opts = {}) {
   const highWater = opts.highWater ?? HIGH_WATER;
   const lowWater = opts.lowWater ?? LOW_WATER;
+  // 先驗「是不是有限數」，再比大小。只留下面那個 lowWater >= highWater 的比較，
+  // NaN 會整組靜默溜過去：NaN 的任何比較都是 false，所以建構成功，
+  // 之後 `bufferedAmount > highWater` 也永遠是 false —— 背壓從此不存在。
+  // 實測 createSender(ch, { highWater: NaN }) 送 3 MiB：backpressureWaits 是 0、
+  // bufferedAmount 一路堆到 10,000,000，沒有任何錯誤，只是「看起來比較快」。
+  // 所以門檻一定要用 Number.isFinite 驗，不能靠比較。
+  for (const [name, value] of [['highWater', highWater], ['lowWater', lowWater]]) {
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error(
+        `背壓門檻 ${name} 必須是非負的有限數，收到的是 ${value}。` +
+        'NaN 或 Infinity 不會讓比較丟錯，只會讓背壓靜默失效、記憶體無上限地堆。',
+      );
+    }
+  }
   if (lowWater >= highWater) {
     throw new Error(
       `背壓門檻設反了：lowWater(${lowWater}) 必須小於 highWater(${highWater})，` +
@@ -197,8 +227,25 @@ export function createReceiver(onMessage, opts = {}) {
     throw new Error('createReceiver(onMessage) 需要一個 callback 來接收重組完成的 ArrayBuffer。');
   }
   const maxInFlight = opts.maxInFlight ?? MAX_IN_FLIGHT;
+  // 同上：NaN 的比較永遠是 false，所以 `partials.size >= maxInFlight` 這道上限
+  // 會靜默失效，「送一百萬個 chunk 0」就真的能把記憶體堆爆 —— 而那正是這個
+  // 上限唯一的存在理由。用 Number.isInteger 驗，不用比較。
+  if (!Number.isInteger(maxInFlight) || maxInFlight < 1) {
+    throw new Error(
+      `maxInFlight 必須是 ≥ 1 的整數，收到的是 ${maxInFlight}。` +
+      'NaN / Infinity / 小數都會讓同時重組中的訊息數上限靜默失效。',
+    );
+  }
   /** messageId -> { chunkCount, received, parts: Array<Uint8Array> } */
   const partials = new Map();
+  /**
+   * 最近完成的 messageId（環狀，見 COMPLETED_MEMORY）。
+   * 填 -1 是因為 messageId 是 u32，-1 永遠不會是合法值，不必另外記「有沒有填過」。
+   * 用普通 Array 而不是 Int32Array：messageId 0xffffffff 存進 Int32Array 會變成 -1，
+   * 剛好撞上這個哨兵值 —— 繞回測試用的正是那個 id。
+   */
+  const completed = new Array(COMPLETED_MEMORY).fill(-1);
+  let completedCursor = 0;
 
   /**
    * 餵進一個 chunk。可以直接餵 MessageEvent，也可以餵 ArrayBuffer。
@@ -210,10 +257,22 @@ export function createReceiver(onMessage, opts = {}) {
     const data = eventOrBuffer && eventOrBuffer.data !== undefined
       ? eventOrBuffer.data
       : eventOrBuffer;
+    // Blob 才是「忘了設 binaryType」的真正症狀（§4.4）：binaryType 的預設值是
+    // 'blob'，忘了設的那一端 onmessage 拿到的就是 Blob，不是字串。
+    // 這兩個提示原本掛反了 —— 可以操作的那一句掛在字串分支，而字串跟 binaryType
+    // 一點關係也沒有（那是對端真的送了文字），於是唯一需要提示的情況拿到的是
+    // 「必須是 ArrayBuffer」這種查不出所以然的通用訊息。不要再換回去。
+    if (isBlob(data)) {
+      throw new Error(
+        '收到 Blob。兩端都必須明確設 binaryType = \'arraybuffer\'（§4.4）—— ' +
+        '包含 ondatachannel 收到的那一個，各家引擎的預設值歷史上並不一致。' +
+        'Blob 只能非同步讀出位元組，chunk 層不接受，也不該偷偷幫你 await。',
+      );
+    }
     if (typeof data === 'string') {
       throw new Error(
-        '收到字串訊息。兩端都必須明確設 binaryType = \'arraybuffer\'（§4.4）—— ' +
-        '包含 ondatachannel 收到的那一個，各家引擎的預設值歷史上並不一致。',
+        '收到字串訊息。chunk 層只吃二進位 chunk —— 對端把文字（例如 JSON 控制訊息）' +
+        '送到了同一條 DataChannel 上，或根本不是用這個版本的 dcframe 送的。',
       );
     }
     const bytes = asBytes(data, '收到的 chunk');
@@ -222,6 +281,15 @@ export function createReceiver(onMessage, opts = {}) {
       throw new Error(
         `chunk 只有 ${bytes.byteLength} 位元組，連 ${CHUNK_HEADER_SIZE} 位元組的子標頭都放不下。` +
         '對端不是用這個版本的 dcframe 送的，或訊息在途中被截斷了。',
+      );
+    }
+    // 另一個方向的越界同樣要擋：單一個 200000 位元組的 chunk 原本會被照單全收，
+    // 重組出一則遠大於 CHUNK_SIZE 的訊息 —— 但沒有任何合法送出端能產生它，
+    // 收到就代表對端壞了。收下來只會把「誰送壞了」這件事拖到更下游才爆。
+    if (bytes.byteLength > CHUNK_SIZE) {
+      throw new Error(
+        `chunk 總長 ${bytes.byteLength} 位元組超過 CHUNK_SIZE ${CHUNK_SIZE}（§4.5.6）。` +
+        '合法的送出端每塊最多送 8 + 16376 位元組，不可能產生這種 chunk。',
       );
     }
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -239,6 +307,46 @@ export function createReceiver(onMessage, opts = {}) {
       throw new Error(
         `訊息 ${messageId} 的 chunkIndex ${chunkIndex} 超出 chunkCount ${chunkCount}。` +
         '兩者都是 u16，合法範圍是 0 ≤ chunkIndex < chunkCount。',
+      );
+    }
+
+    // 酬載長度也要驗，而且要在建 entry 之前驗（無狀態的檢查先做，畸形的 chunk
+    // 不該佔掉一個 in-flight 名額）。
+    //
+    // 少了這一段的實際症狀：`handle(chunk(id=1, idx=0, cnt=2, 100 位元組))` 之後
+    // `handle(chunk(id=1, idx=1, cnt=2, 4 位元組))`，onMessage 收到一則 **104 位元組**
+    // 的訊息、inFlight 歸零、全程無錯 —— 但 cnt=2 的合法送出端一定送了 16376+N。
+    // 被截斷的那一塊就這樣靜默變成「短一截但長得很合理」的張量，正是本模組開頭
+    // 說要防的那種錯：下游不會炸，只會慢慢偏掉。
+    const payloadLen = bytes.byteLength - CHUNK_HEADER_SIZE;
+    const isLast = chunkIndex === chunkCount - 1;
+    if (!isLast && payloadLen !== MAX_CHUNK_PAYLOAD) {
+      throw new Error(
+        `訊息 ${messageId} 的 chunk ${chunkIndex}（共 ${chunkCount} 塊）帶了 ${payloadLen} ` +
+        `位元組的酬載，但非最後一塊必須剛好是 ${MAX_CHUNK_PAYLOAD} 位元組。` +
+        '這塊被截斷了，或對端的分塊算術和這裡不一致。',
+      );
+    }
+    // 最後一塊只驗下界：上界由前面那道「總長不得超過 CHUNK_SIZE」蓋掉了，
+    // 在這裡再寫一次 payloadLen > MAX_CHUNK_PAYLOAD 會是永遠為假的死條件，
+    // 沒有任何輸入能讓測試釘住它。
+    // 長度 0 只有「整則訊息就是空的」時才合法（chunkCount === 1）；
+    // 多塊訊息的最後一塊是 0，代表送出端多切了一塊，同樣是算術不一致。
+    const minLast = chunkCount === 1 ? 0 : 1;
+    if (isLast && payloadLen < minLast) {
+      throw new Error(
+        `訊息 ${messageId} 的最後一塊帶了 ${payloadLen} 位元組的酬載，` +
+        `合法範圍是 ${minLast}..${MAX_CHUNK_PAYLOAD}。`,
+      );
+    }
+
+    // 重播一則**已經交付**的訊息要丟錯，不是當成新訊息重收一遍。見 COMPLETED_MEMORY。
+    if (isCompleted(messageId)) {
+      throw new Error(
+        `訊息 ${messageId} 已經重組完成並交付過了，這個 chunk ${chunkIndex} 是重播。` +
+        `DataChannel 是 reliable + ordered，不該出現重送（§4.4）；` +
+        `收下它會讓同一則 frame 被下游算兩次。` +
+        `（只記得最近 ${COMPLETED_MEMORY} 則，更早的重播這一層抓不到。）`,
       );
     }
 
@@ -273,6 +381,7 @@ export function createReceiver(onMessage, opts = {}) {
     if (entry.received < entry.chunkCount) return;
 
     partials.delete(messageId);
+    rememberCompleted(messageId);
     let total = 0;
     for (const part of entry.parts) total += part.byteLength;
     const out = new Uint8Array(total);
@@ -284,12 +393,34 @@ export function createReceiver(onMessage, opts = {}) {
     onMessage(out.buffer);
   }
 
+  function isCompleted(messageId) {
+    return completed.indexOf(messageId) >= 0;
+  }
+
+  function rememberCompleted(messageId) {
+    completed[completedCursor] = messageId;
+    completedCursor = (completedCursor + 1) % COMPLETED_MEMORY;
+  }
+
   return {
     handle,
     stats() {
-      return { inFlight: partials.size, maxInFlight };
+      return { inFlight: partials.size, maxInFlight, completedMemory: COMPLETED_MEMORY };
     },
   };
+}
+
+/**
+ * 是不是 Blob。跨 realm（iframe / worker / 不同 window）的 Blob 不會通過
+ * instanceof，所以 instanceof 失敗之後還要再看一次形狀 —— 這個分支要給的是
+ * 「你忘了設 binaryType」那句提示，判斷不準就等於沒有提示。
+ */
+function isBlob(v) {
+  if (typeof Blob !== 'undefined' && v instanceof Blob) return true;
+  return !!v && typeof v === 'object'
+    && typeof v.arrayBuffer === 'function'
+    && typeof v.size === 'number'
+    && typeof v.type === 'string';
 }
 
 /** ArrayBuffer / TypedArray / DataView 一律看成位元組視圖，不複製。 */

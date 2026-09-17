@@ -48,13 +48,23 @@ def n_outliers(d, frac=OUTLIER_FRAC):
 
 def outlier_index_bytes(d, n_out):
     """
-    離群索引的編碼方式取兩者中較省的：
-      - u16 索引表：n_out * 2 位元組
-      - bitmap：    ceil(d / 8) 位元組
-    3% 的離群比例下索引表一定勝出（3% < 1/16 = 6.25%），但把兩者都算出來
-    比較誠實 —— 如果之後把 outlier_frac 調高，交叉點會自己出現。
+    離群索引一律是 u16 索引表：n_out * 2 位元組。
+
+    這裡原本寫 `min(n_out * 2, ceil(d / 8))`，也就是「索引表與 bitmap 取較省的」，
+    理由是「3% < 1/16，索引表一定勝出，但兩者都算比較誠實」。**那是錯的**，
+    而且錯得會讓這支程式與真正送上線的位元組對不上：
+
+    1. `docs/01-architecture.md` §4.5.4 只定義了 u16 索引表這一種編碼，
+       `web/src/wire.js` 也只寫得出這一種。規格沒有的東西不能出現在帳上。
+    2. 「3% 永遠小於 6.25%」也不成立：真正生效的比例是
+       `n_outliers(d) / d = max(1, floor(d * frac)) / d`，那個 max(1) 讓小 d 的
+       實際比例遠高於 frac —— d < 34 時就已經超過 6.25%。實測 d ∈ {1,2,4,8}
+       時這兩份帳每則訊息差 1 個位元組，而 wire.js 送出去的是索引表那個數字。
+
+    bitmap 確實會在 outlier_frac 超過 6.25% 之後比較省，但要改成 bitmap
+    **必須先改 §4.5.4**，再同時改 wire.js 與這裡；在那之前這個函式不准自作主張。
     """
-    return min(n_out * 2, math.ceil(d / 8))
+    return n_out * 2
 
 
 def layout(scheme, d, k, scale_prec="fp16"):
