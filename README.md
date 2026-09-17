@@ -183,7 +183,7 @@ python3 spike/verify_shards.py --dir out/
 # 在瀏覽器裡跑 / 部署到 Cloudflare
 cd web
 npm ci
-npm run setup    # 裝 Python 套件（會自己找到你的 Python）
+npm run setup    # 建 .venv 並裝 Python 套件（不會動到系統 Python）
 npm run dev      # 開 http://localhost:8080 自己玩
 npm test         # 用 headless 瀏覽器驗證整條流水線
 npm run deploy   # 建置 + 產生模型 + 部署（不需要付款方式）

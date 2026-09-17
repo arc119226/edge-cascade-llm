@@ -15,12 +15,46 @@
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 
-const CANDIDATES = [
+/** repo 根目錄下的虛擬環境位置。 */
+const VENV_DIR = path.resolve(import.meta.dirname, '..', '..', '.venv');
+
+/**
+ * venv 裡的 python 執行檔路徑（各平台不同）。
+ * 回傳路徑字串；不保證它存在或能執行 —— 那交給下面的實際執行測試。
+ */
+export function venvPython() {
+  return process.platform === 'win32'
+    ? path.join(VENV_DIR, 'Scripts', 'python.exe')
+    : path.join(VENV_DIR, 'bin', 'python');
+}
+
+export { VENV_DIR };
+
+/** 系統 Python 的候選順序（找不到 venv 時才用）。 */
+const SYSTEM_CANDIDATES = [
   ['python3', []],
   ['python', []],
   ['py', ['-3']], // Windows Python Launcher
 ];
+
+/**
+ * 完整的候選順序：venv 優先。
+ *
+ * 為什麼 venv 要排第一：本專案的套件裝在 repo 的 .venv 裡，
+ * 不動使用者的全域 Python。這不是潔癖 —— 實際踩過：
+ * 對全域環境跑 `pip install --upgrade torch` 會把使用者原本的
+ * CUDA 版 torch 換成 PyPI 的 CPU 版，連帶弄壞依賴它的 torchaudio。
+ * 一個專案的安裝腳本沒有資格改動使用者其他專案共用的套件版本。
+ */
+function candidates() {
+  const venv = venvPython();
+  return existsSync(venv)
+    ? [[venv, []], ...SYSTEM_CANDIDATES]
+    : SYSTEM_CANDIDATES;
+}
 
 /** Windows 轉址 stub 的特徵字串。 */
 function looksLikeStoreStub(output) {
@@ -35,7 +69,7 @@ function looksLikeStoreStub(output) {
 export function findPython(opts = {}) {
   let sawStoreStub = false;
 
-  for (const [cmd, prefix] of CANDIDATES) {
+  for (const [cmd, prefix] of candidates()) {
     const r = spawnSync(cmd, [...prefix, '-c', 'import sys; print(sys.version_info[0])'], {
       encoding: 'utf8',
       windowsHide: true,
@@ -68,7 +102,9 @@ export function findPython(opts = {}) {
       '    Windows  https://www.python.org/downloads/ （安裝時勾選 "Add python.exe to PATH"）\n' +
       '    macOS    brew install python\n' +
       '    Linux    用你的套件管理員安裝 python3\n' +
-      '  已嘗試過的指令：python3、python、py -3',
+      '  已嘗試過的指令：.venv 內的 python、python3、python、py -3\n' +
+      '\n' +
+      '  提示：`cd web && npm run setup` 會建立 .venv 並裝好所有套件。',
     );
   }
   process.exit(1);

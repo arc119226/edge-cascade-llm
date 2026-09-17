@@ -44,10 +44,16 @@ npm run deploy     # 建置 + 產生模型 + 部署
 第一次跑 `npm run prepare-model` 需要幾分鐘（要下載模型並量化），
 之後 `out/` 裡有東西就會直接沿用。
 
-> **`npm run setup` 會用 `--upgrade` 安裝。** 這是必要的：
-> `pip install X` 對已經裝過的套件只會說「Requirement already satisfied」而不升級。
-> 本專案需要 **transformers 5.0 以上**（v4 的 `from_pretrained` 不認得 `dtype` 參數），
-> 機器上若有舊版會導致匯出失敗。腳本會在版本太舊時直接擋下並告訴你怎麼升級。
+> **`npm run setup` 會在 repo 根目錄建一個 `.venv`，套件裝在那裡面，
+> 不會動到你的系統 Python。**
+>
+> 這一點是踩過坑才改的：早期版本直接對全域環境跑 `pip install --upgrade`，
+> 把使用者原本的 **CUDA 版 torch** 換成了 PyPI 的 CPU 版，連帶弄壞
+> 依賴它的 torchaudio。一個專案的安裝腳本沒有資格改動你其他專案共用的
+> 套件版本 —— 在隔離的 venv 裡升級才是安全的。
+>
+> 本專案需要 **transformers 5.0 以上**（v4 的 `from_pretrained` 不認得
+> `dtype` 參數）。腳本會在版本太舊時直接擋下並告訴你怎麼處理。
 
 ### 想自己控制匯出參數
 
@@ -244,6 +250,29 @@ shard_N.onnx   shard_N.onnx.data（或它的 .partN 片段）
 你打到 Windows 的 App Execution Alias 轉址 stub 了，不是真的 Python。
 最簡單的解法是**不要手動打 Python 指令**，改用 `npm run setup` 與 `npm run deploy` ——
 它們會自己找到正確的 Python。要手動跑的話見上面「陷阱二」。
+
+**安裝時出現一堆 `WARNING: The scripts ... are installed in ... which is not on PATH`**
+可以忽略。那些是 `torchrun.exe`、`hf.exe`、`transformers.exe` 之類的命令列工具，
+本專案一個都沒用到（我們只 import 函式庫，不呼叫它們的 CLI）。
+
+**安裝時出現 `ERROR: pip's dependency resolver ... torchaudio requires torch==X, but you have torch Y`**
+如果你是用 `npm run setup`（會裝進 `.venv`），這不會發生。
+
+若你是**手動**對全域環境安裝而看到這個，代表你原本的 torch 被換掉了，
+依賴它的套件（torchaudio、torchvision 等）會壞掉。本專案不受影響
+（我們沒用到那些），但你其他的 PyTorch 專案會。
+
+想還原原本的版本（把版本號換成你原本的，`+cu128` 表示 CUDA 12.8）：
+
+```bat
+python -m pip install --force-reinstall ^
+       torch==2.10.0 torchaudio==2.10.0 ^
+       --index-url https://download.pytorch.org/whl/cu128
+```
+
+> PyPI 上的 Windows torch 是 **CPU 版**（約 124 MB）。CUDA 版要從
+> `download.pytorch.org` 裝，體積大得多。本專案只需要 CPU 就夠 ——
+> 匯出模型不吃 GPU。
 
 **`transformers 版本太舊`**
 機器上有舊版 transformers，而 `pip install` 不會自動升級。
