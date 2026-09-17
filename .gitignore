@@ -1,0 +1,9 @@
+# M1 spike 輸出（ONNX shard + 參考 logits，體積大且可重新產生）
+out/
+spike/out/
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
